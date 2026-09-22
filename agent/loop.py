@@ -18,6 +18,7 @@ from typing import Any
 
 from agent import llm
 
+
 DEFAULT_SYSTEM = "你是简洁的中文助手，回答不超过三句话。"
 
 
@@ -57,7 +58,13 @@ class AgentLoop:
         #   Q2：能不能在 __init__ 里就把 user 和 assistant 这两条也提前塞好？
         #       为什么不行？
         # ─────────────────────────────────────────────────────────
-        raise NotImplementedError("TODO ① 还没补")
+        self.messages.append({"role": "user", "content": user_text})
+
+        reply = llm.chat(self.messages)
+
+        self.messages.append({"role": "assistant", "content": reply.text})
+        self.last_usage = reply.usage
+        return reply.text
 
     def run_stream(self, user_text: str) -> str:
         """和 run() 做同一件事，只是边收边打印。"""
@@ -84,7 +91,17 @@ class AgentLoop:
         #     提示：messages 的每一项必须是「一条完整消息」，
         #           而且下一轮会把它们全部重新发出去，格式坏了模型就懵了。
         # ─────────────────────────────────────────────────────────
-        raise NotImplementedError("TODO ② 还没补")
+        self.messages.append({"role": "user", "content": user_text})
+
+        pieces: list[str] = []
+        for piece in llm.stream_chat(self.messages):
+            pieces.append(piece)
+            print(piece, end="", flush=True)
+        print()
+
+        reply_text = "".join(pieces)
+        self.messages.append({"role": "assistant", "content": reply_text})
+        return reply_text
 
     def reset(self) -> None:
         """清空对话内容，保留开头的 system。"""
