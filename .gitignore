@@ -1,0 +1,31 @@
+# ===== 环境变量（含 API Key，绝不提交）=====
+.env
+.env.local
+.env.*.local
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+
+# ===== Python 生成物 =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+wheels/
+
+# ===== 测试 / 缓存 =====
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ===== 编辑器 / 系统 =====
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
