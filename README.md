@@ -56,13 +56,14 @@ uv run python cli.py --stream    # 交互模式 + 流式输出
 ## 进度
 
 - [x] **阶段 0**：`stage0_check.py` 跑通，能打印模型回复与 token 用量
-- [ ] **第 1 周**：`agent/llm.py` + `agent/loop.py` + `cli.py`，多轮对话 + 流式
+- [x] **第 1 周**：`agent/llm.py` + `agent/loop.py` + `cli.py`，多轮对话 + 流式
   - [x] `agent/llm.py` —— 模型调用封装
-  - [ ] `agent/loop.py` —— 主循环（2 处 TODO 待自己补）
+  - [x] `agent/loop.py` —— 主循环（两处 TODO 已补齐）
   - [x] `cli.py` —— 命令行入口
-  - [ ] 单轮对话跑通
-  - [ ] 多轮对话跑通（模型记得前两句）
-  - [ ] 流式输出跑通
+  - [x] 单轮对话跑通
+  - [x] 多轮对话跑通（模型记得前两句）
+  - [x] 流式输出跑通
+  - [x] `/reset` 后确实失忆（验证「记忆 = messages 列表」）
 - [ ] 第 2 周：`agent/tools/`，模型能自主调工具
 - [ ] 第 3 周：会话持久化 + 上下文裁剪 + 长期记忆
 - [ ] 第 4 周：HTTP 接口 + 测试 + 打包
