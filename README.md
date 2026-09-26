@@ -18,7 +18,12 @@ mini-agent/
 ├── agent/
 │   ├── __init__.py
 │   ├── llm.py          # 模型调用封装 —— 唯一与厂商耦合的文件
-│   └── loop.py         # 核心循环 —— 记忆在这里
+│   ├── loop.py         # 核心循环 —— 记忆在这里
+│   └── tools/          # 【第 2 周】工具层
+│       ├── __init__.py
+│       ├── base.py     # 工具基类 + Schema 生成
+│       ├── registry.py # 注册表 + 自动发现
+│       └── get_time.py # 第一个工具
 ├── cli.py              # 命令行入口
 └── .venv/              # 虚拟环境（uv 自动创建，不进 Git）
 ```
@@ -35,9 +40,24 @@ uv run python stage0_check.py    # 阶段 0 验收：调通模型接口
 uv run python cli.py "你好"       # 单轮提问
 uv run python cli.py             # 交互模式（多轮对话）
 uv run python cli.py --stream    # 交互模式 + 流式输出
+uv run python cli.py --tools     # 【第 2 周】交互模式 + 工具
 ```
 
 交互模式内置命令：`/reset` 清空上下文，`/exit` 退出。
+
+## 加一个新工具要做什么
+
+**只做一件事：在 `agent/tools/` 下新建一个 .py 文件**，里面写 `Tool` 的子类，
+填好 `name` / `description` / `parameters` 三个类属性，实现 `run()`。
+
+注册表（`registry.py`）会自动扫描这个目录并收走它，**别处一行都不用改**。
+
+## 第 2 周的代价：工具说明书是固定开销
+
+`tools` 字段**每一轮请求都要重发一遍**。实测 1 个工具会让 `prompt_tokens` 从 17 涨到 276。
+
+一次工具调用要发两次请求（先拿 `tool_calls`，回填结果后再拿答案），实测约 714 tokens ——
+是普通一问一答的十倍。所以 `max_iterations` 不是可选项。
 
 ## 三条必须记住的规则
 
@@ -64,6 +84,15 @@ uv run python cli.py --stream    # 交互模式 + 流式输出
   - [x] 多轮对话跑通（模型记得前两句）
   - [x] 流式输出跑通
   - [x] `/reset` 后确实失忆（验证「记忆 = messages 列表」）
-- [ ] 第 2 周：`agent/tools/`，模型能自主调工具
+- [ ] **第 2 周**：`agent/tools/`，模型能自主调工具（v0.3）
+  - [x] `agent/tools/base.py` —— 工具基类 + Schema 生成
+  - [x] `agent/tools/registry.py` —— 注册表 + 自动发现
+  - [x] `agent/tools/get_time.py` —— 第一个工具
+  - [x] `llm.py` 支持 `tools` 与 `tool_calls`
+  - [x] `cli.py` 加 `--tools` 开关
+  - [ ] `loop.py` 的 `run_with_tools()`（3 处 TODO 待补）
+  - [ ] 问「现在几点」能自动调 `get_time`
+  - [ ] 坏 JSON 不崩溃
+  - [ ] `max_iterations` 能拦住死循环
 - [ ] 第 3 周：会话持久化 + 上下文裁剪 + 长期记忆
 - [ ] 第 4 周：HTTP 接口 + 测试 + 打包

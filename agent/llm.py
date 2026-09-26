@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 import httpx
@@ -29,17 +29,99 @@ class ConfigError(RuntimeError):
 
 
 @dataclass
+class ToolCall:
+    """模型的一次「调用请求」。第 2 周新增。
+
+    三个字段实测确认（2026-09-26，本项目中转站）：
+        id        服务商给的编号，形如 "call_7dd76c91071b4358b42008d8"。
+                  回填结果时必须原样带上，模型靠它对上号。
+        name      要调哪个函数。长这样："get_time"
+        arguments **字符串**，不是 dict！长这样："{}" 或 '{"path":"a.txt"}'
+                  所以用之前必须 json.loads()。这是新手最容易踩的一脚。
+    """
+
+    id: str
+    name: str
+    arguments: str
+
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any]) -> "ToolCall":
+        """把服务商返回的那一坨拆成三个干净字段。
+
+        嵌套结构（实测）：
+            {"id": "call_xxx", "type": "function",
+             "function": {"name": "get_time", "arguments": "{}"}}
+
+        全用 .get() 取值并给兜底，是因为这些字段理论上都可能缺 ——
+        缺了也不该崩，让它变成一个「名字是空的工具」，后面的报错会更友好。
+        """
+        function = raw.get("function") or {}
+        return cls(
+            id=raw.get("id") or "",
+            name=function.get("name") or "",
+            arguments=function.get("arguments") or "",
+        )
+
+    def parsed_arguments(self) -> dict[str, Any]:
+        """把 arguments 解析成 dict。解析失败时返回空 dict，不抛异常。
+
+        为什么容错而不是抛错？
+            模型产出坏 JSON 是**必然会发生**的事（ROADMAP 第 2 周第 2 个设计问题）。
+            为它崩掉整轮对话不值得。返回空 dict 后，工具会因为缺参数而报错，
+            那条错误信息会回到模型手里，它通常能自己纠正过来。
+        """
+        if not self.arguments or not self.arguments.strip():
+            return {}
+        try:
+            value = json.loads(self.arguments)
+        except json.JSONDecodeError:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def to_raw(self) -> dict[str, Any]:
+        """还原成服务商要的原始结构（回填时用）。"""
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {"name": self.name, "arguments": self.arguments},
+        }
+
+
+@dataclass
 class Reply:
     """一次回复。text 是正文，usage 是 token 账本。
 
     为什么用 dataclass 而不是直接返回字符串？
         因为「成本控制」是贯穿全程的质量线 —— 每次请求都必须留下 token 账。
         返回字符串就把账丢了。
+
+    第 2 周多了 tool_calls：
+        模型有两种「回复」方式 —— 说一段话，或者要求你调函数。
+        **要求调函数时 text 是空字符串**，所以不能只看 text 判断成功与否。
     """
 
     text: str
     usage: dict[str, Any]
     reasoning_chars: int = 0
+    tool_calls: list[ToolCall] = field(default_factory=list)
+
+    @property
+    def wants_tools(self) -> bool:
+        """模型的真实意图是「先帮我办事」而不是「回答你」。"""
+        return bool(self.tool_calls)
+
+    def to_message(self) -> dict[str, Any]:
+        """转成能塞回 messages 的 assistant 消息。
+
+        为什么只挑三个字段，而不是把服务商返回的 message 整体存回去？
+            因为原始 message 里带着 reasoning_content 这类私有字段。
+            服务商对未知字段的容忍度不一致 —— 有的直接 400。
+            只留协议规定的三个，才换得过服务商。
+        """
+        message: dict[str, Any] = {"role": "assistant", "content": self.text}
+        if self.tool_calls:
+            message["tool_calls"] = [tc.to_raw() for tc in self.tool_calls]
+        return message
 
 
 def load_config() -> dict[str, Any]:
@@ -78,26 +160,44 @@ def _headers(cfg: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _payload(cfg: dict[str, Any], messages: list[dict[str, str]], stream: bool) -> dict:
-    return {
+def _payload(
+    cfg: dict[str, Any],
+    messages: list[dict[str, Any]],
+    stream: bool,
+    tools: list[dict[str, Any]] | None = None,
+) -> dict:
+    payload: dict[str, Any] = {
         "model": cfg["LLM_MODEL_ID"],
         "messages": messages,
         "max_tokens": cfg["max_tokens"],
         "stream": stream,
     }
+    # 只在真的带工具时才加这个字段。
+    # 不传 tools 时，服务商根本不会返回 tool_calls —— 这也是 v0.1/v0.2 还能照常跑的原因。
+    if tools:
+        payload["tools"] = tools
+    return payload
 
 
-def chat(messages: list[dict[str, str]], cfg: dict[str, Any] | None = None) -> Reply:
+def chat(
+    messages: list[dict[str, Any]],
+    cfg: dict[str, Any] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+) -> Reply:
     """把整个 messages 发出去，拿回完整回复。
 
     注意一个事实：每调用一次，messages 里**全部**内容都会被重新发一遍。
     这就是「多轮对话」的真实成本结构 —— 聊得越久，每轮越贵。第 3 周专门解决它。
+
+    tools 参数（第 2 周新增）：
+        传了它就是「这些是我能帮你调的函数，这是它们的说明书」。
+        模型有需要时会返回 tool_calls 而不是正文。
     """
     cfg = cfg or load_config()
     resp = httpx.post(
         cfg["url"],
         headers=_headers(cfg),
-        json=_payload(cfg, messages, stream=False),
+        json=_payload(cfg, messages, stream=False, tools=tools),
         timeout=cfg["timeout"],
     )
     if resp.status_code != 200:
@@ -107,22 +207,28 @@ def chat(messages: list[dict[str, str]], cfg: dict[str, Any] | None = None) -> R
     message = data["choices"][0]["message"]
     text = (message.get("content") or "").strip()
     reasoning = message.get("reasoning_content") or ""
+    tool_calls = [ToolCall.from_raw(tc) for tc in (message.get("tool_calls") or [])]
 
     # 推理模型（本项目当前用的就是）会先产出一段思考，思考也算 max_tokens。
     # 思考偶尔会把额度吃满，导致 content 是空字符串。
-    # 这个检查就是为了让你一眼看出「回复为空」不是代码写错了。
-    if not text:
+    # 但注意加了个前提：**要求调工具时正文本来就该是空的**，那不是故障。
+    if not text and not tool_calls:
         raise RuntimeError(
             "模型只产出了思考、没有正文。\n"
             "最常见原因是 max_tokens 被思考 token 吃满 —— 把 .env 里的 LLM_MAX_TOKENS 调大。\n"
             f"（本次思考 {len(reasoning)} 字）"
         )
 
-    return Reply(text=text, usage=data.get("usage") or {}, reasoning_chars=len(reasoning))
+    return Reply(
+        text=text,
+        usage=data.get("usage") or {},
+        reasoning_chars=len(reasoning),
+        tool_calls=tool_calls,
+    )
 
 
 def stream_chat(
-    messages: list[dict[str, str]], cfg: dict[str, Any] | None = None
+    messages: list[dict[str, Any]], cfg: dict[str, Any] | None = None
 ) -> Iterator[str]:
     """一小段一小段地拿回复。
 
