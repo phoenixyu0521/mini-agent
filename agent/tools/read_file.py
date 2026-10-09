@@ -37,6 +37,44 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # 或者把几万行内容全塞进对话把 token 烧光。
 DEFAULT_MAX_BYTES = 4000
 
+# ─────────────────────────────────────────────────────────────────
+# 敏感目标：项目**里面**也不能读的东西。
+#
+# 为什么光有「限制在项目目录内」还不够？
+# 因为 .env（你的 API Key）本来就在项目目录里。
+# 路径校验回答的是「能不能跑到项目外」，但 .env 根本没跑出去 ——
+# 它一直堂堂正正地待在 mini-agent/.env。模型只要 read_file(".env") 就拿到了。
+#
+# 所以要**两层**：
+#   第一层  路径限制在项目内     → 防「往外跑」（你已经写好了）
+#   第二层  敏感目标拒绝         → 防「项目内的敏感文件」（这一层）
+#
+# 又是同一个道理：白名单管「允许什么」永远列不全，
+# 所以关键凭据要有一份**显式的拒绝清单**。
+# ─────────────────────────────────────────────────────────────────
+DENIED_DIR_NAMES = {
+    ".git",        # 仓库历史与远程地址
+    ".venv",       # 虚拟环境，几百个文件
+    "__pycache__", # 编译缓存，无意义
+    "node_modules",
+}
+
+DENIED_FILE_NAMES = {
+    ".env",
+    "id_rsa",
+    "id_ed25519",
+    "credentials",
+    "secrets",
+}
+
+# 按后缀拦：不管文件名是什么，只要是这个类型就拒。
+DENIED_SUFFIXES = {
+    ".key",        # 私钥
+    ".pem",
+    ".pfx",
+    ".p12",
+}
+
 
 class ReadFileTool(Tool):
     name = "read_file"
@@ -96,12 +134,40 @@ class ReadFileTool(Tool):
         #      **安全相关的默认值，永远选「拒绝」那一侧。**
         #      补完校验后，把这一行删掉。
         # ─────────────────────────────────────────────────────────
-        return f"[错误] read_file 的路径校验还没实现（TODO ①），出于安全考虑已拒绝本次读取。"
+        # 1) 把模型给的相对路径，拼到项目根目录下，再"打平"成绝对路径
+        raw_path = str(path).strip()
+        if not raw_path:
+            return "[错误] path 是空的，请告诉我读哪个文件（例如 README.md）。"
+
+        target = (PROJECT_ROOT / raw_path).resolve()
+
+        # 2) 关键一步：判断它有没有逃出项目目录
+        if not target.is_relative_to(PROJECT_ROOT):
+            return (
+                f"[错误] 路径 {raw_path} 超出了项目目录，我只能读项目里的文件。"
+                f"请给我一个项目内的相对路径（例如 README.md）。"
+            )
+
+        # 3) 顺带挡一下目录本身（目录读不了，当文件读会报错）
+        if target.is_dir():
+            return f"[错误] {raw_path} 是一个目录，不能直接读取。"
+
+        # 4) 第二层防护：项目内的敏感目标一律拒绝。
+        #    .env 就在项目里，路径校验挡不住它 —— 只能靠显式拒绝。
+        #    先看路径的**任意一段目录名**（parts）是不是在拒绝目录里。
+        for part in target.parts:
+            if part.lower() in DENIED_DIR_NAMES:
+                return f"[错误] {raw_path} 位于受保护目录 {part}/ 内，我不能读取。"
+
+        # 再看文件名本身
+        if target.name.lower() in DENIED_FILE_NAMES:
+            return f"[错误] {raw_path} 是敏感文件（可能含凭据），我不能读取。"
+
+        # 最后看后缀（.key / .pem / .pfx / .p12）
+        if target.suffix.lower() in DENIED_SUFFIXES:
+            return f"[错误] {raw_path} 是 {target.suffix} 类型的密钥文件，我不能读取。"
 
         # ---- 以下是校验通过之后的读文件逻辑，已写完整 ----
-
-        if target.is_dir():
-            return f"[错误] {path} 是一个目录，不能直接读取。"
 
         if not target.exists():
             return f"[错误] 文件不存在：{path}"

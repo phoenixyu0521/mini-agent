@@ -121,7 +121,29 @@ class RunShellTool(Tool):
         #    一条命令都不许执行。registry.call() 会把它接住、转成错误字符串
         #    回给模型，所以不会崩，只是模型会看到一条「工具执行失败」。
         #    补完白名单后，把这一行删掉。
-        raise NotImplementedError("TODO ② 还没补，白名单未实现，出于安全考虑已拒绝执行")
+        # 1) 拆词。posix=False 是必须的 —— Windows 路径里的反斜杠不是转义符
+        try:
+            parts = shlex.split(str(command), posix=False)
+        except ValueError as exc:
+            return f"[错误] 命令格式不对（引号没闭合）：{exc}"
+
+        if not parts:
+            return "[错误] command 是空的，请给我一条命令（例如 dir）。"
+
+        # 2) 取第一个词当可执行文件名，规范化后查白名单
+        exe = parts[0].strip().strip('"').lower()
+        if exe.endswith(".exe"):
+            exe = exe[:-4]  # 切掉 ".exe" 这 4 个字符
+
+        if exe not in ALLOWED_COMMANDS:
+            allowed = "、".join(sorted(ALLOWED_COMMANDS))
+            return (
+                f"[错误] 命令 {parts[0]} 不被允许。我只能执行这些：{allowed}。"
+                f"如果用户要做的事超出这个范围，直接告诉他做不到。"
+            )
+
+        # 3) 把长命令原样交给 subprocess（它接收列表形式 + shell=False）
+        command = parts
 
         # ---- 以下是校验通过之后的执行逻辑，已写完整 ----
 
