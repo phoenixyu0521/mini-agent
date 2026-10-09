@@ -169,7 +169,9 @@ class AgentLoop:
             #   不存，下一轮发出去的历史里就没有它自己说过的话。
             # ─────────────────────────────────────────────────────────
             if not reply.wants_tools:
-                raise NotImplementedError("TODO ① 还没补")
+                self.messages.append(reply.to_message())
+                self.last_usage = reply.usage
+                return reply.text
 
             # ─────────────────────────────────────────────────────────
             # TODO ② —— 它要求调工具，你替它办事
@@ -201,7 +203,14 @@ class AgentLoop:
             #        什么都不做，让 for 循环进入下一轮 —— 把已经变长的 messages
             #        再发一次。下一轮模型看到工具结果，才会说出人话。
             # ─────────────────────────────────────────────────────────
-            raise NotImplementedError("TODO ② 还没补")
+            self.messages.append(reply.to_message())
+
+            for tc in reply.tool_calls:
+                args = tc.parsed_arguments()
+                result = self.tools.call(tc.name, args)
+                self.messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": result}
+                )
 
         # ─────────────────────────────────────────────────────────
         # TODO ③ —— 循环跑满 max_iterations 还没结束
@@ -213,4 +222,4 @@ class AgentLoop:
         #   要写的是：返回一句人话，说明出了什么事。
         #   别让它静默返回空（那样 CLI 会打印出 None，用户会以为程序坏了）。
         # ─────────────────────────────────────────────────────────
-        raise NotImplementedError("TODO ③ 还没补")
+        return f"已达到最大工具调用轮数（{max_iterations}），我先停在这里。"
