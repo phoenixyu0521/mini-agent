@@ -13,6 +13,9 @@
     uv run python cli.py --no-compact        关闭上下文自动压缩（看 token 一直涨）
     uv run python cli.py --no-memory         关闭长期记忆注入（对比有没有记忆的差别）
 
+    uv run python cli.py --profiles          第 3 周第四块：列出 config.json 里的配置档案
+    uv run python cli.py --profile deepseek  换一套配置跑（模型 / 超时 / max_tokens 全变）
+
 第 2 周新增的是 `--tools`。它做两件事：
     1. 让 AgentLoop 去扫描 agent/tools/ 目录，把工具收进注册表
     2. 走 run_with_tools() 而不是 run()，也就是那套「两次请求」的循环
@@ -22,6 +25,10 @@
     所以连敲两次 `python cli.py`，第二次会接着第一次聊。
     想断开历史用 `--new-session`；想接回更早的某次用 `--resume <编号>`。
 
+第 3 周第四块新增的是配置化。模型名 / 超时 / max_tokens 搬去了 config.json：
+    `--profiles` 看有哪些档案，`--profile <名字>` 换一套。
+    API Key 仍然只在 .env 里（它是凭据，不进 Git）。
+
 交互模式里还有这些内置命令：
     /reset             清空上下文（用来亲眼验证「记忆是 messages 列表」这件事）
     /history           查看当前会话的完整消息列表
@@ -29,6 +36,7 @@
     /compact           看压缩过几次、最近一次省了多少
     /memory            查看长期记忆文件内容
     /remember <内容>   往长期记忆里写一条（立刻生效）
+    /config            查看当前生效的配置（不显示 API Key）
     /exit              退出
 """
 
@@ -37,13 +45,14 @@ from __future__ import annotations
 import argparse
 import sys
 
+from agent import config as config_mod
 from agent import context, llm
 from agent.loop import DEFAULT_SYSTEM, AgentLoop
 from agent.memory import Memory
 from agent.session import Session
 
 
-VERSION = "v0.6"
+VERSION = "v0.7"
 
 
 def parse_args() -> argparse.Namespace:
@@ -90,11 +99,43 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="关闭长期记忆注入（用来对比「有没有记忆」的差别）",
     )
+    # ── 第 3 周第四块新增：配置化 ───────────────────────
+    parser.add_argument(
+        "--profile",
+        metavar="NAME",
+        default=None,
+        help="用 config.json 里的哪套配置（见 --profiles）；不填则用 default",
+    )
+    parser.add_argument(
+        "--profiles",
+        action="store_true",
+        help="列出 config.json 里所有可用的配置档案然后退出",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    # ── --profiles：列完就退，也不需要 Key ────────────────
+    # 和 --sessions 同一个道理：看「有哪些配置档案」是纯本地操作。
+    if args.profiles:
+        names = config_mod.list_profiles()
+        if not names:
+            print("config.json 里还没有任何 profile（或文件格式有问题）。")
+            print(f"路径：{config_mod.CONFIG_PATH}")
+            return
+        try:
+            raw = config_mod.load_raw()
+            default_name = raw.get("default") or config_mod.DEFAULT_PROFILE
+        except config_mod.ConfigError:
+            default_name = "?"
+        print(f"config.json 里的配置档案（默认：{default_name}）：")
+        for name in names:
+            mark = " ←默认" if name == default_name else ""
+            print(f"  {name}{mark}")
+        print("\n切换方式：uv run python cli.py --profile <名字>")
+        return
 
     # ── --sessions：列完就退，不需要 Key，也不需要联网 ──────
     # 为什么放在 load_config() 之前？
@@ -118,10 +159,22 @@ def main() -> None:
     # 开头就把配置验一遍。
     # 为什么不等到第一次提问才验？因为那时你已经敲完一句话，
     # 报错信息会和你的输入混在一起，看着像代码坏了。
+    #
+    # 第 3 周第四块：这里同时捕获两个 ConfigError ——
+    #   config_mod.ConfigError 来自 config.json（profile 名拼错、JSON 格式坏）
+    #   llm.ConfigError        来自 llm.py（历史遗留的同名类，见 config.py 注释）
+    # 保留两个 try 是因为它们语义不同，合并要动 llm.py 的公开接口（第 4 周再统一）。
     try:
-        llm.load_config()
-    except llm.ConfigError as exc:
+        llm.load_config(args.profile)
+    except (config_mod.ConfigError, llm.ConfigError) as exc:
         print("[配置错误]", exc)
+        sys.exit(1)
+    except NotImplementedError as exc:
+        # TODO ① / ② 还没补时走到这里。
+        # 为什么不让它直接崩？因为那会甩出一大段 traceback，
+        # 看起来像「整个项目坏了」，而其实只差两个函数没写。
+        print("[配置模块还没写完]", exc)
+        print("  提示：去补 agent/config.py 的两处 TODO，说明都写在注释里了。")
         sys.exit(1)
 
     # ── 第 3 周：决定用哪个 session ───────────────────────
@@ -193,6 +246,11 @@ def main() -> None:
 
     # ---- 交互模式 ----
     banner = f"mini-agent {VERSION}  |  /reset 清空上下文  |  /exit 退出"
+    # 第 3 周第四块：显示当前用的是哪套配置（不显示 Key）
+    try:
+        banner += "\n" + config_mod.resolve(args.profile).summary()
+    except (config_mod.ConfigError, llm.ConfigError, NotImplementedError):
+        pass  # 上面已经验过一次，理论上到不了这里
     if restored:
         info = session.stats()
         banner += (
@@ -270,6 +328,19 @@ def main() -> None:
             content = text[len("/remember "):].strip()
             agent.remember("- " + content)
             print(f"[已记入长期记忆] {content}")
+            continue
+        # 第 3 周第四块：看看现在生效的配置（安全 —— 不打印 Key）
+        if text == "/config":
+            try:
+                conf = config_mod.resolve(args.profile)
+                print(f"[当前配置] {conf.summary()}")
+                print(f"  配置文件：{config_mod.CONFIG_PATH}")
+                names = config_mod.list_profiles()
+                print(f"  可用档案：{'、'.join(names)}（用 --profile <名字> 切换）")
+            except (config_mod.ConfigError, llm.ConfigError) as exc:
+                print(f"[配置错误] {exc}")
+            except NotImplementedError as exc:
+                print(f"[配置模块还没写完] {exc}")
             continue
 
         try:

@@ -4,14 +4,17 @@
     将来从这家换到那家，只改这一个文件，其余代码一行不动。
     这正是 nanobot 把 providers/ 单独成目录的原因。
 
-对外提供四样东西：
-    load_config()      读 .env，缺项就报错
+对外提供五样东西：
+    load_config()      读配置（.env 的 Key + config.json 的模型参数），缺项就报错
     chat()             一次性拿回完整回复（v0.1）
     stream_chat()      一小段一小段地拿（v0.2）
     format_usage()     把 token 用量排成人话（成本控制，第 1 周就要开始记）
-
-第 3 周新增：
     make_summarizer()  造一个「把旧对话压成摘要」的函数（给 context.py 用）
+
+第 3 周第四块（配置化）的改动：
+    load_config() 内部改成调用 config.resolve()。**函数签名和返回值都不变** ——
+    因为 chat() / stream_chat() / make_summarizer() 三处都在用它，
+    改签名会连锁改动。这就是「保持接口稳定」的实际价值。
 """
 
 from __future__ import annotations
@@ -23,6 +26,8 @@ from typing import Any, Iterator
 
 import httpx
 from dotenv import load_dotenv
+
+from agent import config as _config
 
 load_dotenv()
 
@@ -127,32 +132,32 @@ class Reply:
         return message
 
 
-def load_config() -> dict[str, Any]:
-    """从环境变量读配置。缺任何一项就抛 ConfigError。
+def load_config(profile: str | None = None) -> dict[str, Any]:
+    """读配置，返回一个**扁平**的 dict。缺 Key 就抛 ConfigError。
+
+    第 3 周第四块之后，真正的解析逻辑搬去了 agent/config.py，
+    这里只做一层「翻译」：把 Config 对象摊平成原来的 dict 形状。
+
+    为什么不干脆让所有调用方改用 Config 对象？
+        因为 chat() / stream_chat() / make_summarizer() 都在用这个 dict，
+        而且它们关心的是 cfg["url"] / cfg["timeout"] 这几个具体 key。
+        把它摊平成 dict，**三个调用方一行都不用改** —— 这就是「保持接口稳定」。
 
     为什么不给缺项兜底默认值？
         带着半个配置去调接口，报的错会离真正原因很远（401 / 404 / 模型不存在），
         你会白排查半小时。宁可在门口就拦下。
     """
-    required = ["LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL_ID"]
-    cfg: dict[str, Any] = {}
-    missing = []
-    for key in required:
-        value = os.getenv(key)
-        if not value or "请替换" in value:
-            missing.append(key)
-        else:
-            cfg[key] = value
-    if missing:
-        raise ConfigError("缺少配置：" + "、".join(missing) + "（检查 .env 是否已填好）")
-
-    # os.getenv 的第二个参数是默认值。有了它，返回值就不可能是 None。
-    # max_tokens / timeout 是「调优参数」，给默认值合理；
-    # API Key 那种「身份信息」才绝不能给默认值。
-    cfg["max_tokens"] = int(os.getenv("LLM_MAX_TOKENS", "2048"))
-    cfg["timeout"] = int(os.getenv("LLM_TIMEOUT", "30"))
-    cfg["url"] = cfg["LLM_BASE_URL"].rstrip("/") + "/chat/completions"
-    return cfg
+    conf = _config.resolve(profile)
+    return {
+        "LLM_BASE_URL": conf.base_url,
+        "LLM_API_KEY": conf.api_key,
+        "LLM_MODEL_ID": conf.model,
+        "max_tokens": conf.max_tokens,
+        "timeout": conf.timeout,
+        "url": conf.url,
+        # 顺带把 profile 名也带上 —— cli.py 的横幅要显示它
+        "profile": conf.profile,
+    }
 
 
 def _headers(cfg: dict[str, Any]) -> dict[str, str]:
