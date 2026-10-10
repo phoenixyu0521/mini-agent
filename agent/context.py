@@ -87,13 +87,23 @@ Summarizer = Callable[[list[dict[str, Any]]], str]
 # ── 水位线参数 ──────────────────────────────────────────────
 # 「最近 N 条」是保留区。注意它包含 user/assistant/tool 各类消息，
 # 不是「N 轮」——一轮对话通常产生 2 条（user + assistant），带工具时更多。
-KEEP_RECENT = 12
+#
+# KEEP_RECENT=8  ≈ 保留最近 4 轮普通对话。
+# 为什么是 4 轮而不是 10 轮？
+#   保留区越大，每轮要发的 token 越多 —— 这正是我们要省的东西。
+#   而 4 轮足够模型理解「现在在聊什么」。
+KEEP_RECENT = 8
 
 # 超过这个条数就触发压缩。
-# 为什么留出一段间隔（12 → 20）而不是一超就压？
-#   因为压缩本身要花一次模型调用。如果阈值也是 12，那就是「刚压完立刻又超」，
-#   每轮都压。留 8 条的缓冲，压一次能撑好几轮。
-COMPACT_AT = 20
+# 为什么留出一段间隔（8 → 12）而不是一超就压？
+#   因为压缩本身要花一次模型调用。如果阈值也是 8，那就是「刚压完立刻又超」，
+#   每轮都压，反而更贵。留 4 条缓冲，压一次能撑 1~2 轮。
+#
+# 这两个数是**可调参数**，没有标准答案：
+#   对话密度大（每轮很长）→ 调低，省 token 更重要
+#   对话需要长记忆 → 调高，但成本上去了
+# 生产系统会按 **token 数**而不是条数来算水位线，那需要 tokenizer，第 4 周再说。
+COMPACT_AT = 12
 
 
 def estimate_tokens(messages: list[dict[str, Any]]) -> int:
@@ -195,7 +205,20 @@ def summarize_early(
     early: list[dict[str, Any]],
     summarize: Summarizer,
 ) -> dict[str, Any]:
-    raise NotImplementedError("TODO ① 还没补：summarize_early() 还没实现")
+    lines = []
+    for m in early:
+        content = m.get("content")
+        if isinstance(content, str) and content.strip():
+            lines.append(f"{m.get('role')}: {content}")
+        for tc in m.get("tool_calls") or []:
+            name = (tc.get("function") or {}).get("name")
+            lines.append(f"{m.get('role')}: (调用了工具 {name})")
+
+    summary = summarize(early)
+    return {
+        "role": "system",
+        "content": "以下是早先对话的摘要（更早的原始内容已省略）：\n" + summary,
+    }
 
 
 # ─────────────────────────────────────────────────────────
@@ -255,4 +278,17 @@ def compact(
     summarize: Summarizer,
     keep_recent: int = KEEP_RECENT,
 ) -> list[dict[str, Any]]:
-    raise NotImplementedError("TODO ② 还没补：compact() 还没实现")
+    if not needs_compaction(messages):
+        return messages
+
+    keep_from = len(messages) - keep_recent
+    if keep_from <= 1:
+        return messages
+
+    head = messages[0]
+    early = messages[1:keep_from]
+    recent = messages[keep_from:]
+
+    summary_message = summarize_early(early, summarize)
+
+    return [head, summary_message, *recent]
