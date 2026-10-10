@@ -11,6 +11,7 @@
     uv run python cli.py --resume 20261010-140032    恢复指定会话
     uv run python cli.py --new-session       强制开一个新会话
     uv run python cli.py --no-compact        关闭上下文自动压缩（看 token 一直涨）
+    uv run python cli.py --no-memory         关闭长期记忆注入（对比有没有记忆的差别）
 
 第 2 周新增的是 `--tools`。它做两件事：
     1. 让 AgentLoop 去扫描 agent/tools/ 目录，把工具收进注册表
@@ -22,11 +23,13 @@
     想断开历史用 `--new-session`；想接回更早的某次用 `--resume <编号>`。
 
 交互模式里还有这些内置命令：
-    /reset    清空上下文（用来亲眼验证「记忆是 messages 列表」这件事）
-    /history  查看当前会话的完整消息列表
-    /tokens   看全量条数 vs 下一轮实际发送条数（看裁剪是否生效）
-    /compact  看压缩过几次、最近一次省了多少
-    /exit     退出
+    /reset             清空上下文（用来亲眼验证「记忆是 messages 列表」这件事）
+    /history           查看当前会话的完整消息列表
+    /tokens            看全量条数 vs 下一轮实际发送条数（看裁剪是否生效）
+    /compact           看压缩过几次、最近一次省了多少
+    /memory            查看长期记忆文件内容
+    /remember <内容>   往长期记忆里写一条（立刻生效）
+    /exit              退出
 """
 
 from __future__ import annotations
@@ -36,10 +39,11 @@ import sys
 
 from agent import context, llm
 from agent.loop import DEFAULT_SYSTEM, AgentLoop
+from agent.memory import Memory
 from agent.session import Session
 
 
-VERSION = "v0.5"
+VERSION = "v0.6"
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,6 +83,12 @@ def parse_args() -> argparse.Namespace:
         "--no-compact",
         action="store_true",
         help="关闭上下文自动压缩（用来看 token 一路涨上去的样子）",
+    )
+    # ── 第 3 周后半段新增：长期记忆 ─────────────────────
+    parser.add_argument(
+        "--no-memory",
+        action="store_true",
+        help="关闭长期记忆注入（用来对比「有没有记忆」的差别）",
     )
     return parser.parse_args()
 
@@ -135,6 +145,7 @@ def main() -> None:
         with_tools=args.tools,
         session=session,
         auto_compact=not args.no_compact,
+        memory=None if args.no_memory else Memory(),
     )
 
     # 恢复还是新建？只有读完才知道 —— 新建的 session 文件还不存在。
@@ -143,6 +154,23 @@ def main() -> None:
         # 只有「没恢复成功」时才写开场行。
         # 刚 load 成功却再 start() 一次，会把文件清空覆盖掉 —— 这是个容易犯的错。
         session.start(agent.messages[0]["content"])
+
+    # ── 第 3 周后半段：读长期记忆 ─────────────────────────
+    # 它**不放进 self.messages**，而是单独存在 _memory_message 里，
+    # 每次发请求时由 _view() 临时插进去。
+    #
+    # 为什么不直接 append 进 self.messages？
+    #   因为 self.messages 是要落盘的会话历史。记忆是**背景资料**，
+    #   不是这次对话说过的话 —— 混进去会让 session 文件变得很奇怪
+    #   （打开一看第一行是记忆、后面才是对话）。
+    #   而且 reset() 时也说不清该不该保留它。
+    #   **让两个东西各归各位。**
+    memory_on = agent.memory is not None
+    if memory_on:
+        agent.memory.ensure_exists()
+        has_memory = agent.load_memory()
+    else:
+        has_memory = False
 
     # ---- 单轮模式 ----
     if args.prompt:
@@ -175,6 +203,12 @@ def main() -> None:
         names = agent.tools.names()
         banner += f"\n工具已启用（{len(names)} 个）：{'、'.join(names)}"
     banner += f"\n本轮对话将存为：{session.session_id}"
+    if memory_on:
+        st = agent.memory.stats()
+        if has_memory:
+            banner += f"\n长期记忆已加载：{st['lines']} 行（约 {st['est_tokens']} tokens）"
+        else:
+            banner += "\n长期记忆为空（用 /remember <内容> 写第一条）"
     print(banner)
 
     while True:
@@ -216,6 +250,26 @@ def main() -> None:
         if text == "/tokens":
             est = context.estimate_tokens(agent.messages)
             print(f"全量 {len(agent.messages)} 条 ≈ {est} tokens；下一轮发送 {len(agent._view())} 条")
+            continue
+        # 第 3 周后半段：长期记忆的手动入口
+        if text == "/memory":
+            if not memory_on:
+                print("[长期记忆已关闭]（启动时带了 --no-memory）")
+                continue
+            st = agent.memory.stats()
+            if not st["exists"] or not st["lines"]:
+                print("[记忆为空] 用 /remember <内容> 写第一条")
+                continue
+            print(f"[{st['path']}] {st['lines']} 行，{st['chars']} 字（约 {st['est_tokens']} tokens）")
+            print(agent.memory.path.read_text(encoding="utf-8").strip())
+            continue
+        if text.startswith("/remember "):
+            if not memory_on:
+                print("[长期记忆已关闭]（启动时带了 --no-memory）")
+                continue
+            content = text[len("/remember "):].strip()
+            agent.remember("- " + content)
+            print(f"[已记入长期记忆] {content}")
             continue
 
         try:

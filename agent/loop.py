@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent import context, llm
+from agent.memory import Memory
 from agent.session import Session
 from agent.tools import registry
 
@@ -33,6 +34,7 @@ class AgentLoop:
         with_tools: bool = False,
         session: Session | None = None,
         auto_compact: bool = True,
+        memory: Memory | None = None,
     ) -> None:
         # 全部记忆就是一个列表。
         # 第 0 条是「规矩」，它定义它是谁、怎么说话 —— 这一条永不改变，
@@ -78,6 +80,38 @@ class AgentLoop:
         self.compact_count = 0
         self.last_compact_saving = 0
 
+        # ── 第 3 周：长期记忆 ────────────────────────────────
+        # 它和 session 是两个不同的东西：
+        #   session  这次对话说了什么（流水账，会被压缩）
+        #   memory   关于用户「不变的」事实（档案，永不裁剪）
+        self.memory = memory
+        # 本轮的长期记忆消息（还没注入时是 None）
+        self._memory_message: dict[str, str] | None = None
+
+    def load_memory(self) -> bool:
+        """读长期记忆。成功读到内容返回 True。
+
+        为什么不在 __init__ 里直接读？
+            为了和 load_session() 保持一致的形状，也让 cli 能决定
+            「要不要检查一下 memory 文件是否该创建」。
+        """
+        if self.memory is None:
+            return False
+        self._memory_message = self.memory.load()
+        return self._memory_message is not None
+
+    def remember(self, line: str) -> None:
+        """往长期记忆里追加一条，并让本轮立刻生效。
+
+        为什么写完要顺手更新 self._memory_message？
+            否则这一轮问它「你记住了吗」，它还说不知道 —— 因为你只写了磁盘，
+            没改当前这次请求要发的东西。写完要立刻反映到现场。
+        """
+        if self.memory is None:
+            return
+        self.memory.append(line)
+        self._memory_message = self.memory.load()
+
     def _get_summarizer(self) -> Any:
         """惰性造摘要器。只在真的需要压缩时才会被调到。"""
         if self._summarizer is None:
@@ -98,11 +132,12 @@ class AgentLoop:
         为什么不让 compact() 直接改 self.messages？
             因为用户可能用 /history 看全部，而且 session 文件里应该存完整历史。
             裁剪是「每次请求临时算一遍」，不是「把数据删了」。
+
+        第 3 周后半段它又多了一件事：**注入长期记忆**。
+        注入的位置很关键 —— 见下面 inject_memory 的注释。
         """
-        if not self.auto_compact:
-            return self.messages
-        if not context.needs_compaction(self.messages):
-            return self.messages
+        if not self._should_compact():
+            return self._inject_memory(self.messages)
 
         before = context.estimate_tokens(self.messages)
         try:
@@ -112,7 +147,7 @@ class AgentLoop:
             # 代价是可能撞窗口，但那总比当场崩掉好。
             # 这是第 2 周 registry.call() 就确立的模式：局部失败不该拖垮全局。
             print(f"[警告] 上下文压缩失败，本轮降级为全量发送：{exc}")
-            return self.messages
+            return self._inject_memory(self.messages)
 
         after = context.estimate_tokens(view)
         if len(view) < len(self.messages):
@@ -122,7 +157,46 @@ class AgentLoop:
                 f"[已压缩上下文] {len(self.messages)} 条 → {len(view)} 条，"
                 f"约省 {self.last_compact_saving} tokens"
             )
-        return view
+        return self._inject_memory(view)
+
+    def _should_compact(self) -> bool:
+        """该不该压缩。抽出来是为了让逻辑读起来清楚：先问「要不要压」，再压。"""
+        return self.auto_compact and context.needs_compaction(self.messages)
+
+    def _inject_memory(self, view: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """把长期记忆插进视图。
+
+        ⚠️ **插入位置是这一小段的核心。**
+
+        长期记忆是一条 role="system" 的消息，它必须排在**所有对话之前**，
+        也就是紧跟原始的 system 提示词：
+
+            正确的（历史顺序不会被割裂）：
+                [ 原始 system ]
+                [ 长期记忆 system ]   ← 插在这里
+                [ 摘要 system ]        ← 压缩产生的
+                [ user / assistant ... ]
+
+            错误的（记忆被当成「刚才发生的事」）：
+                [ 原始 system ]
+                [ 摘要 system ]
+                [ user / assistant ... ]
+                [ 长期记忆 system ]    ← 塞到最后 → 模型以为这是刚收到的指令
+
+        为什么这么在意顺序？
+            因为 messages 列表是**时间正序**的对话记录。模型读它就像读聊天记录，
+            越靠后越「新」。长期记忆是背景资料，不是新发生的事，
+            所以它必须在最前面。
+        """
+        if self._memory_message is None:
+            return view
+        if not view:
+            return view
+
+        # 不修改传进来的 view —— 用切片拼新的。
+        # 虽然这里 view 通常已经是临时对象了，但保持「不改参数」的习惯，
+        # 能避免以后有人把 self.messages 直接传进来时踩雷。
+        return [view[0], self._memory_message, *view[1:]]
 
     # ── 第 3 周：会话持久化（脚手架，已写完整）───────────────
     # 这两个方法是「接线」，不含 Agent 原理，所以直接给全。
