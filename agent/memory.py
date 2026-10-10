@@ -149,7 +149,22 @@ class Memory:
     #       （提示：它每一轮都会被发出去）
     # ─────────────────────────────────────────────────────────
     def load(self) -> dict[str, str] | None:
-        raise NotImplementedError("TODO ① 还没补：load() 还没实现")
+        # 1) 文件不存在 → 没有记忆。注意：读的函数不负责创建文件
+        if not self.path.exists():
+            return None
+
+        # 2) 读内容。encoding 不能省，Windows 默认 GBK 会把中文读成乱码
+        text = self.path.read_text(encoding="utf-8").strip()
+
+        # 3) 全是空白 = 没有内容。空消息对模型没意义，还白占 token
+        if not text:
+            return None
+
+        # 4) 加上前缀，拼成一条独立的 system 消息
+        return {
+            "role": "system",
+            "content": INJECTION_HEADER + "\n" + text,
+        }
 
     # ── 写 ──────────────────────────────────────────────────
 
@@ -183,7 +198,17 @@ class Memory:
     #   Q：为什么这里用追加而不用覆盖写？想想 memory 和 session 的共同点。
     # ─────────────────────────────────────────────────────────
     def append(self, line: str) -> None:
-        raise NotImplementedError("TODO ② 还没补：append() 还没实现")
+        # 1) 空行直接扔。写空行只会让文件越来越乱
+        line = line.rstrip("\n")
+        if not line.strip():
+            return
+
+        # 2) 先确保文件存在 —— 不然新建出来的是个没有标题说明的秃文件
+        self.ensure_exists()
+
+        # 3) 追加一行。mode="a" 只写末尾，不碰已有内容
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
 
     # ── 调试用 ──────────────────────────────────────────────
 
