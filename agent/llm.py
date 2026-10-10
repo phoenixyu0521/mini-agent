@@ -5,10 +5,13 @@
     这正是 nanobot 把 providers/ 单独成目录的原因。
 
 对外提供四样东西：
-    load_config()    读 .env，缺项就报错
-    chat()           一次性拿回完整回复（v0.1）
-    stream_chat()    一小段一小段地拿（v0.2）
-    format_usage()   把 token 用量排成人话（成本控制，第 1 周就要开始记）
+    load_config()      读 .env，缺项就报错
+    chat()             一次性拿回完整回复（v0.1）
+    stream_chat()      一小段一小段地拿（v0.2）
+    format_usage()     把 token 用量排成人话（成本控制，第 1 周就要开始记）
+
+第 3 周新增：
+    make_summarizer()  造一个「把旧对话压成摘要」的函数（给 context.py 用）
 """
 
 from __future__ import annotations
@@ -291,3 +294,72 @@ def format_usage(usage: dict[str, Any] | None) -> str:
     if reasoning:
         line += f"（其中思考 {reasoning}）"
     return line + f" = {total}"
+
+
+# ── 第 3 周新增：摘要器 ─────────────────────────────────────
+# 为什么放在 llm.py 而不是 context.py？
+#   因为**它要调模型**。而「与厂商耦合的代码只允许出现在 llm.py」
+#   是本项目的铁律。context.py 只定义「需要一个摘要函数」，
+#   具体怎么调模型由这里提供 —— 这就是依赖注入的好处。
+
+SUMMARIZE_PROMPT = (
+    "以下是一段对话记录。请把它压缩成一段简洁的中文摘要，用于后续对话的背景。\n"
+    "只保留这些：用户的身份与偏好、已确认的事实与结论、正在进行的任务、明确的承诺。\n"
+    "不要保留：寒暄、重复内容、被否决的方案、工具调用的技术细节。\n"
+    "直接输出摘要正文，不要加任何前言或标题。控制在 200 字以内。"
+)
+
+
+def make_summarizer(cfg: dict[str, Any] | None = None) -> Any:
+    """造一个「把一串消息压成摘要」的函数。
+
+    返回的函数签名是 `f(messages: list[dict]) -> str`，
+    正好符合 context.Summarizer 的约定。
+
+    为什么要「造一个函数」而不是直接提供一个函数？
+        因为要先把 cfg 定下来（否则每次摘要都要重新读 .env）。
+        这叫**闭包** —— 内层函数记住了外层的 cfg。
+        你在 stage0_check.py 里其实见过类似的写法，只是当时没意识到。
+    """
+    cfg = cfg or load_config()
+
+    def _summarize(early: list[dict[str, Any]]) -> str:
+        # 把结构复杂的消息先抹平成纯文本。
+        # 为什么不在 context.py 里做？因为「怎么转成文本」其实取决于
+        # 厂商对消息格式的要求 —— 又是一件与协议相关的事，所以归 llm.py。
+        lines: list[str] = []
+        for m in early:
+            role = m.get("role") or "?"
+            content = m.get("content")
+            if isinstance(content, str) and content.strip():
+                lines.append(f"{role}: {content}")
+            # tool_calls 只留个痕迹，不留完整参数 —— 摘要不需要它们
+            for tc in m.get("tool_calls") or []:
+                function = tc.get("function") or {}
+                lines.append(f"{role}: (调用了工具 {function.get('name')})")
+        blob = "\n".join(lines)
+
+        # 摘要是一次独立的请求。它不带 tools —— 我们只要它说话，不要它调函数。
+        resp = httpx.post(
+            cfg["url"],
+            headers=_headers(cfg),
+            json={
+                "model": cfg["LLM_MODEL_ID"],
+                "messages": [
+                    {"role": "system", "content": SUMMARIZE_PROMPT},
+                    {"role": "user", "content": blob},
+                ],
+                "max_tokens": 512,   # 摘要很短，512 足够，别用 2048 浪费
+                "stream": False,
+            },
+            timeout=cfg["timeout"],
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"摘要请求失败 HTTP {resp.status_code}\n{resp.text}")
+
+        message = resp.json()["choices"][0]["message"]
+        # 用 .get 并兜底空串：推理模型偶尔会把 512 全用在思考上，
+        # content 就是空的。宁可返回空串（调用方能判断），也别在这里崩。
+        return (message.get("content") or "").strip()
+
+    return _summarize

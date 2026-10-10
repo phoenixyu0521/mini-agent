@@ -10,6 +10,7 @@
     uv run python cli.py --sessions          第 3 周：列出最近的会话然后退出
     uv run python cli.py --resume 20261010-140032    恢复指定会话
     uv run python cli.py --new-session       强制开一个新会话
+    uv run python cli.py --no-compact        关闭上下文自动压缩（看 token 一直涨）
 
 第 2 周新增的是 `--tools`。它做两件事：
     1. 让 AgentLoop 去扫描 agent/tools/ 目录，把工具收进注册表
@@ -20,10 +21,12 @@
     所以连敲两次 `python cli.py`，第二次会接着第一次聊。
     想断开历史用 `--new-session`；想接回更早的某次用 `--resume <编号>`。
 
-交互模式里还有三条内置命令：
-    /reset   清空上下文（用来亲眼验证「记忆是 messages 列表」这件事）
-    /history 查看当前会话的完整消息列表
-    /exit    退出
+交互模式里还有这些内置命令：
+    /reset    清空上下文（用来亲眼验证「记忆是 messages 列表」这件事）
+    /history  查看当前会话的完整消息列表
+    /tokens   看全量条数 vs 下一轮实际发送条数（看裁剪是否生效）
+    /compact  看压缩过几次、最近一次省了多少
+    /exit     退出
 """
 
 from __future__ import annotations
@@ -31,12 +34,12 @@ from __future__ import annotations
 import argparse
 import sys
 
-from agent import llm
+from agent import context, llm
 from agent.loop import DEFAULT_SYSTEM, AgentLoop
 from agent.session import Session
 
 
-VERSION = "v0.4"
+VERSION = "v0.5"
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,6 +74,11 @@ def parse_args() -> argparse.Namespace:
         "--sessions",
         action="store_true",
         help="列出最近的会话然后退出",
+    )
+    parser.add_argument(
+        "--no-compact",
+        action="store_true",
+        help="关闭上下文自动压缩（用来看 token 一路涨上去的样子）",
     )
     return parser.parse_args()
 
@@ -126,6 +134,7 @@ def main() -> None:
         args.system or DEFAULT_SYSTEM,
         with_tools=args.tools,
         session=session,
+        auto_compact=not args.no_compact,
     )
 
     # 恢复还是新建？只有读完才知道 —— 新建的 session 文件还不存在。
@@ -185,10 +194,28 @@ def main() -> None:
             continue
         # 第 3 周新增：/history 在当前会话里问「我聊了些什么」
         if text == "/history":
-            print(f"[{session.session_id}] 共 {len(agent.messages)} 条消息")
+            est = context.estimate_tokens(agent.messages)
+            view = agent._view()
+            print(f"[{session.session_id}] 共 {len(agent.messages)} 条消息（约 {est} tokens）")
+            if len(view) != len(agent.messages):
+                print(f"  下一轮实际发送：{len(view)} 条（已裁剪）")
             for i, m in enumerate(agent.messages):
                 c = (m.get("content") or "")[:50].replace("\n", " ")
-                print(f"  {i:2d}. {m['role']:9s} {c}")
+                tag = " [tool_calls]" if m.get("tool_calls") else ""
+                print(f"  {i:2d}. {m['role']:9s}{tag} {c}")
+            continue
+        if text == "/compact":
+            if agent.compact_count == 0:
+                print("[还没压缩过] 消息数未到水位线，或压缩失败了。")
+            else:
+                print(
+                    f"[压缩过 {agent.compact_count} 次] "
+                    f"最近一次省了约 {agent.last_compact_saving} tokens"
+                )
+            continue
+        if text == "/tokens":
+            est = context.estimate_tokens(agent.messages)
+            print(f"全量 {len(agent.messages)} 条 ≈ {est} tokens；下一轮发送 {len(agent._view())} 条")
             continue
 
         try:

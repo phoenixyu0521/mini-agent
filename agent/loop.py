@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent import llm
+from agent import context, llm
 from agent.session import Session
 from agent.tools import registry
 
@@ -32,6 +32,7 @@ class AgentLoop:
         system_prompt: str = DEFAULT_SYSTEM,
         with_tools: bool = False,
         session: Session | None = None,
+        auto_compact: bool = True,
     ) -> None:
         # 全部记忆就是一个列表。
         # 第 0 条是「规矩」，它定义它是谁、怎么说话 —— 这一条永不改变，
@@ -65,6 +66,63 @@ class AgentLoop:
         # 新建会话时是 1（因为第 0 条 system 由 session.start() 单独写，不走 append）。
         # 详见 flush_session() 里的解释。
         self._flushed = 1 if session is not None else 0
+
+        # ── 第 3 周：上下文裁剪 ──────────────────────────────
+        # auto_compact=False 时永远不压缩（调试用：想亲眼看 token 涨到爆就用它）。
+        self.auto_compact = auto_compact
+        # 摘要函数。**注意它默认是 None，在第一次需要时才造** ——
+        # 因为造它要 load_config()（读 .env），而 cli 的单轮模式可能压根不需要它。
+        # 这个手法叫「惰性初始化」（lazy init）。
+        self._summarizer: Any = None
+        # 记录压缩过几次、最近一次省了多少 —— 第 4 周做可观测性时会正式用。
+        self.compact_count = 0
+        self.last_compact_saving = 0
+
+    def _get_summarizer(self) -> Any:
+        """惰性造摘要器。只在真的需要压缩时才会被调到。"""
+        if self._summarizer is None:
+            self._summarizer = llm.make_summarizer()
+        return self._summarizer
+
+    def _view(self) -> list[dict[str, Any]]:
+        """返回「本轮要发给模型的视图」——可能比 self.messages 短。
+
+        ⚠️ 这是第 3 周最关键的一个概念区分：
+
+            self.messages  是**全量历史**（真相，永不删减，要落盘）
+            self._view()   是**本次请求的视图**（可能是裁剪过的）
+
+        两者从这一刻起就不再是同一个东西了。之前三周它们一直是同一个，
+        所以你可以直接 self.messages 发出去。现在不行。
+
+        为什么不让 compact() 直接改 self.messages？
+            因为用户可能用 /history 看全部，而且 session 文件里应该存完整历史。
+            裁剪是「每次请求临时算一遍」，不是「把数据删了」。
+        """
+        if not self.auto_compact:
+            return self.messages
+        if not context.needs_compaction(self.messages):
+            return self.messages
+
+        before = context.estimate_tokens(self.messages)
+        try:
+            view = context.compact(self.messages, self._get_summarizer())
+        except Exception as exc:  # noqa: BLE001
+            # 压缩失败不能拖垮对话 —— 退化成「不压缩，原样发」。
+            # 代价是可能撞窗口，但那总比当场崩掉好。
+            # 这是第 2 周 registry.call() 就确立的模式：局部失败不该拖垮全局。
+            print(f"[警告] 上下文压缩失败，本轮降级为全量发送：{exc}")
+            return self.messages
+
+        after = context.estimate_tokens(view)
+        if len(view) < len(self.messages):
+            self.compact_count += 1
+            self.last_compact_saving = before - after
+            print(
+                f"[已压缩上下文] {len(self.messages)} 条 → {len(view)} 条，"
+                f"约省 {self.last_compact_saving} tokens"
+            )
+        return view
 
     # ── 第 3 周：会话持久化（脚手架，已写完整）───────────────
     # 这两个方法是「接线」，不含 Agent 原理，所以直接给全。
@@ -134,7 +192,9 @@ class AgentLoop:
         # ─────────────────────────────────────────────────────────
         self.messages.append({"role": "user", "content": user_text})
 
-        reply = llm.chat(self.messages)
+        # 第 3 周：发出去的是「视图」不是「全量」。
+        # 之前三周这两个是同一个东西，现在可能不同了 —— 见 _view() 的注释。
+        reply = llm.chat(self._view())
 
         self.messages.append({"role": "assistant", "content": reply.text})
         self.last_usage = reply.usage
@@ -169,7 +229,7 @@ class AgentLoop:
         self.messages.append({"role": "user", "content": user_text})
 
         pieces: list[str] = []
-        for piece in llm.stream_chat(self.messages):
+        for piece in llm.stream_chat(self._view()):
             pieces.append(piece)
             print(piece, end="", flush=True)
         print()
@@ -224,9 +284,11 @@ class AgentLoop:
         schemas = self.tools.schema_list()
 
         for round_no in range(1, max_iterations + 1):
-            # 每一轮都把**整个** self.messages 重新发一遍。
+            # 每一轮都把**整个** messages 重新发一遍。
             # 和第 1 周是同一件事，只是列表里现在会多出 tool_calls 和 tool 两种消息。
-            reply = llm.chat(self.messages, tools=schemas)
+            # ⚠️ 注意这里每轮都重算 _view() —— 因为工具结果刚追加进去，
+            #    列表变长了，视图也该跟着变。（压缩判断是幂等的，代价很小）
+            reply = llm.chat(self._view(), tools=schemas)
 
             # ─────────────────────────────────────────────────────────
             # TODO ① —— 它没要求调工具，说明这轮聊完了
