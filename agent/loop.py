@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent import llm
+from agent.session import Session
 from agent.tools import registry
 
 
@@ -26,7 +27,12 @@ DEFAULT_SYSTEM = "你是简洁的中文助手，回答不超过三句话。"
 class AgentLoop:
     """一次会话。self.messages 就是这次会话的全部「记忆」。"""
 
-    def __init__(self, system_prompt: str = DEFAULT_SYSTEM, with_tools: bool = False) -> None:
+    def __init__(
+        self,
+        system_prompt: str = DEFAULT_SYSTEM,
+        with_tools: bool = False,
+        session: Session | None = None,
+    ) -> None:
         # 全部记忆就是一个列表。
         # 第 0 条是「规矩」，它定义它是谁、怎么说话 —— 这一条永不改变，
         # 所以它放在最前面，且 reset() 时保留。
@@ -47,6 +53,63 @@ class AgentLoop:
         # 为什么默认关着？因为工具说明书每一轮都要重发 ——
         # 实测 1 个工具就让 prompt_tokens 从 17 涨到 276。用不上就别付这笔钱。
         self.tools = registry.discover() if with_tools else None
+
+        # ── 第 3 周：会话持久化 ──────────────────────────────
+        # 有了它，程序重启后能接着上次聊。
+        # 注意它**不改变** self.messages 的用法 —— 只是多了一进一出：
+        #     每轮结束 flush 一次，启动时 load 一次顶替 self.messages。
+        # 记忆的载体始终是那个列表，磁盘只是它的备份。
+        self.session = session
+
+        # 「已经落盘到第几条消息了」。load 成功后会被设成 len(restored)，
+        # 新建会话时是 1（因为第 0 条 system 由 session.start() 单独写，不走 append）。
+        # 详见 flush_session() 里的解释。
+        self._flushed = 1 if session is not None else 0
+
+    # ── 第 3 周：会话持久化（脚手架，已写完整）───────────────
+    # 这两个方法是「接线」，不含 Agent 原理，所以直接给全。
+    # 你要写的 TODO ① ② 都在 session.py 里。
+
+    def load_session(self) -> bool:
+        """从磁盘读回上一次的历史。成功返回 True，没有历史返回 False。
+
+        为什么要有返回值？
+            因为「没有旧会话」是**正常情况**（第一次用）而不是错误。
+            cli 要靠它决定打不打印「已恢复上次对话」。
+        """
+        if self.session is None:
+            return False
+        restored = self.session.messages()
+        if not restored:
+            return False
+        # 直接顶替。list 赋值是「换掉整个列表」，不是合并 ——
+        # 这正是我们要的：磁盘上的历史就是全部真相，不要和当前内存里的混在一起。
+        self.messages = restored
+        # 已经落盘到第几条了。flush_session() 靠它知道该从哪继续写。
+        self._flushed = len(restored)
+        return True
+
+    def flush_session(self) -> None:
+        """把「从上次落盘之后新增的消息」追加进 session 文件。
+
+        为什么要单独一个 flush，而不是每轮都全量重写？
+            因为 JSONL 的全部意义就是**只追加**：
+                不用重写历史 → 中途崩了最多丢最后一行，前面完好
+                全量重写 → 崩一次就毁掉整个会话
+            这不是性能考虑，是**数据安全**考虑。
+
+        怎么知道哪些是新的？
+            用 self._flushed 记住「上次写到第几条了」——
+            这是本项目第一次出现「用一个小计数器跟踪状态」，
+            记住这个套路：self.messages 只追加不改写，
+            所以「已处理的条数」就等于「下次的起始下标」。
+        """
+        if self.session is None:
+            return
+        pending = self.messages[self._flushed:]
+        for message in pending:
+            self.session.append(message)
+        self._flushed = len(self.messages)
 
     def run(self, user_text: str) -> str:
         """走完一轮，返回模型回复。"""
@@ -75,6 +138,7 @@ class AgentLoop:
 
         self.messages.append({"role": "assistant", "content": reply.text})
         self.last_usage = reply.usage
+        self.flush_session()   # 第 3 周：这一轮的对话落盘
         return reply.text
 
     def run_stream(self, user_text: str) -> str:
@@ -115,7 +179,16 @@ class AgentLoop:
         return reply_text
 
     def reset(self) -> None:
-        """清空对话内容，保留开头的 system。"""
+        """清空对话内容，保留开头的 system。
+
+        第 3 周加了一个问题：reset 之后磁盘上的文件要不要跟着清？
+        **不清。** 理由：
+            文件是「历史流水账」，已经发生的事不会被 reset 抹掉。
+            就像清空聊天窗口不等于删掉聊天记录。
+        所以这里只清内存，flush_session() 下次会把 system 之后的新内容
+        继续追加到旧文件后面 —— 这是**有意的**：旧记录保留，
+        `/resume <id>` 仍然能看到全部历史。
+        """
         self.messages = self.messages[:1]
 
     # ══════════════════════════════════════════════════════════════════
@@ -171,6 +244,7 @@ class AgentLoop:
             if not reply.wants_tools:
                 self.messages.append(reply.to_message())
                 self.last_usage = reply.usage
+                self.flush_session()   # 第 3 周：工具调用的中间消息也要存
                 return reply.text
 
             # ─────────────────────────────────────────────────────────
