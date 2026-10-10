@@ -22,6 +22,7 @@ mini-agent/
 │   ├── session.py      # 【第 3 周】会话持久化（JSONL）
 │   ├── context.py      # 【第 3 周】上下文裁剪
 │   ├── memory.py       # 【第 3 周】长期记忆（跨会话，防被裁剪）
+│   ├── config.py       # 【第 3 周】配置化（把「凭据」与「配置」分开）
 │   └── tools/          # 【第 2 周】工具层
 │       ├── __init__.py
 │       ├── base.py       # 工具基类 + Schema 生成
@@ -30,6 +31,7 @@ mini-agent/
 │       ├── read_file.py  # 工具 2：读项目内文件（必须做路径校验）
 │       └── run_shell.py  # 工具 3：执行只读命令（必须做白名单）
 ├── cli.py              # 命令行入口
+├── config.json         # 【第 3 周】模型配置档案（进 Git —— 它不是秘密）
 ├── data/sessions/      # 【第 3 周】会话记录（JSONL，已在 .gitignore 中）
 ├── MEMORY.md           # 【第 3 周】长期记忆（你自己也能编辑，已在 .gitignore 中）
 ├── .venv/              # 虚拟环境（uv 自动创建，不进 Git）
@@ -54,11 +56,15 @@ uv run python cli.py --resume 20261010-142117      # 恢复指定会话
 uv run python cli.py --new-session                 # 强制开新会话
 uv run python cli.py --no-compact                  # 【第 3 周】关掉上下文压缩
 uv run python cli.py --no-memory                   # 【第 3 周】关掉长期记忆
+
+uv run python cli.py --profiles                    # 【第 3 周】列出配置档案
+uv run python cli.py --profile deepseek "你好"      # 【第 3 周】换一套配置跑
 ```
 
 交互模式内置命令：`/reset` 清空上下文，`/history` 查看消息列表，
 `/tokens` 看裁剪是否生效，`/compact` 看压缩统计，
-`/memory` 看长期记忆内容，`/remember <内容>` 写一条长期记忆，`/exit` 退出。
+`/memory` 看长期记忆内容，`/remember <内容>` 写一条长期记忆，
+`/config` 看当前生效的配置（不显示 Key），`/exit` 退出。
 
 ## 第 3 周：上下文裁剪 (context.py)
 
@@ -270,6 +276,74 @@ nanobot 用 **Dream** 定时任务补上这一步（额外一次模型调用去�
 
 `agent/llm.py` 的 `chat()` 里已经加了针对这个的诊断报错。
 
+## 第 3 周：配置化 (config.py) —— 把「凭据」和「配置」分开
+
+### 做完之后是什么体验
+
+```bash
+uv run python cli.py --profiles          # 看有哪些配置档案
+uv run python cli.py --profile deepseek "你好"   # 换一套配置跑，代码一行不改
+```
+
+`config.json` 里存着几套预设：
+
+```json
+{
+  "default": "fast",
+  "profiles": {
+    "fast":     { "base_url": "...", "model": "glm-4.7-flash",    "max_tokens": 2048, "timeout": 30 },
+    "deepseek": { "base_url": "...", "model": "deepseek-v4-flash", "max_tokens": 8192, "timeout": 60 }
+  }
+}
+```
+
+### 唯一需要真正理解的事
+
+**凭据（Credential）和配置（Config）不是一回事，应该分开放。**
+
+| | 凭据 | 配置 |
+|---|---|---|
+| 是什么 | 证明「你是谁」 | 描述「怎么干活」 |
+| 例子 | API Key | 模型名、超时、max_tokens |
+| 属于 | **个人** | **项目** |
+| 存哪 | `.env` | `config.json` |
+| 进 Git 吗 | **绝不** | **应该进** |
+
+**为什么这个区分重要？** 因为它们的**生命周期不一样**。你换台电脑，凭据要重新配；
+但配置是跟着项目走的。混在一个文件里，就会出现两难：
+
+- 把 `.env` 提交 → Key 泄露
+- 不提交 → 别人 clone 下来完全不知道该怎么配模型
+
+分开之后两个问题同时解决。这个原则不是我编的 —— 12-Factor App 的第 3 条**就是这一条**。
+
+### 优先级链
+
+```
+--profile deepseek      ← 最高。本次启动说了算
+LLM_PROFILE 环境变量     ← 次之。可以写进 shell 脚本 / CI
+config.json 的 default   ← 兜底
+内置常量 DEFAULT_PROFILE ← 最后兜底
+```
+
+### 两个细节值得一提
+
+**1. 兜底不是到处都给。** `base_url` / `model` / `max_tokens` / `timeout` 都有兜底值 ——
+因为它们错了顶多「效果不好」。但 **API Key 绝不给兜底** —— 它错了是「根本用不了」，
+必须让程序在门口就报错。**兜底只该给「有合理默认值」的东西。**
+
+**2. 打印配置时不显示 Key。** `Config.__repr__()` 和 `summary()` 都把 Key 掩码成
+`abc123...wxyz`。因为**凭据泄露最常见的路径就是日志** —— 你 `print(config)` 调试一下，
+Key 就出现在终端里，然后可能被粘进 issue、截图、聊天记录。
+
+### 一个「保持接口稳定」的实例
+
+`llm.py` 里的 `load_config()` 被 `chat()` / `stream_chat()` / `make_summarizer()`
+三处调用。这次改造它，我**没有改签名也没有改返回值的形状**，只把内部实现换成了
+调用 `config.resolve()`。结果：**三个调用方一行都没动。**
+
+这不是偷懒，是刻意的。接口是契约 —— 能不动就不动，改动成本会沿着调用链扩散。
+
 ## 进度
 
 - [x] **阶段 0**：`stage0_check.py` 跑通，能打印模型回复与 token 用量
@@ -335,7 +409,13 @@ nanobot 用 **Dream** 定时任务补上这一步（额外一次模型调用去�
   > session 恢复的是「同一个会话」；memory 跨「所有会话」。
   > 你曾经 `/resume` 回去却答不出名字 —— 那次是**新会话**，
   > 而且「名字」这种东西永不变，不该靠每次压缩去赌它还在不在。
-- [ ] **配置化 `agent/config.py`**
+- [x] **配置化 `agent/config.py`**：改 JSON 换模型，不用改代码（v0.7）
+  - [ ] `agent/config.py` —— `load_raw()` / `resolve()`（两处 TODO 待补）
+  - [x] `config.json` —— `fast` / `deepseek` 两套预设，**进 Git**
+  - [x] `llm.py` —— `load_config()` 改为包装 `config.resolve()`，**三个调用方一行未改**
+  - [x] `.env.example` 精简为「只剩 API Key」（模型参数已搬去 config.json）
+  - [x] `cli.py` —— `--profile` / `--profiles` / `/config`
+  - [x] `.gitignore` 无需改动（`git check-ignore` 验证 `config.json` 会正常进 Git）
 
   > `reset()` 故意**不**清磁盘文件：文件是历史流水账，不是聊天窗口。
   > 清空窗口 ≠ 删除聊天记录 —— 所以 `/reset` 后接着写，旧记录仍在。
