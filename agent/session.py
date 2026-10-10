@@ -197,7 +197,8 @@ class Session:
             "at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "message": message,
         }
-        raise NotImplementedError("TODO ① 还没补：append() 还没实现")
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     # ── 读 ──────────────────────────────────────────────────
 
@@ -244,7 +245,34 @@ class Session:
     #         但它的「身份」和「说话风格」会突然变成默认值）
     # ─────────────────────────────────────────────────────────
     def messages(self) -> list[dict[str, Any]]:
-        raise NotImplementedError("TODO ② 还没补：messages() 还没实现")
+        if not self.path.exists():
+            return []
+
+        rows = []
+        with open(self.path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue  # ← 坏行跳过，别让整个函数失败
+
+        # ① 从 type=="session" 的那行取出 system
+        system_text = next(
+            (r["system"] for r in rows if r.get("type") == "session"),
+            None,
+        )
+        if system_text is None:
+            return []
+
+        # ② 只收 type=="message" 的，取它的 "message"
+        messages = [r["message"] for r in rows if r.get("type") == "message"]
+
+        # ③ 在最前面补上 system 消息
+        messages.insert(0, {"role": "system", "content": system_text})
+        return messages
 
     # ── 调试用 ──────────────────────────────────────────────
 

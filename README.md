@@ -27,7 +27,8 @@ mini-agent/
 │       ├── read_file.py  # 工具 2：读项目内文件（必须做路径校验）
 │       └── run_shell.py  # 工具 3：执行只读命令（必须做白名单）
 ├── cli.py              # 命令行入口
-└── .venv/              # 虚拟环境（uv 自动创建，不进 Git）
+├── data/sessions/      # 【第 3 周】会话记录（JSONL，已在 .gitignore 中）
+├── .venv/              # 虚拟环境（uv 自动创建，不进 Git）
 ```
 
 ## 常用命令
@@ -43,9 +44,43 @@ uv run python cli.py "你好"       # 单轮提问
 uv run python cli.py             # 交互模式（多轮对话）
 uv run python cli.py --stream    # 交互模式 + 流式输出
 uv run python cli.py --tools     # 【第 2 周】交互模式 + 工具
+
+uv run python cli.py --sessions                    # 【第 3 周】列出最近的会话
+uv run python cli.py --resume 20261010-142117      # 恢复指定会话
+uv run python cli.py --new-session                 # 强制开新会话
 ```
 
-交互模式内置命令：`/reset` 清空上下文，`/exit` 退出。
+交互模式内置命令：`/reset` 清空上下文，`/history` 查看消息列表，`/exit` 退出。
+
+## 第 3 周：为什么用 JSONL 而不是 JSON 数组
+
+`data/sessions/20261010-142117.jsonl` 一行一个 JSON 对象：
+
+```
+{"type":"session","id":"...","created_at":"...","system":"你是简洁的中文助手..."}
+{"type":"message","at":"...","message":{"role":"user","content":"我叫旭"}}
+{"type":"message","at":"...","message":{"role":"assistant","content":"已记住，旭。"}}
+```
+
+| | JSON 数组 | JSONL（本项目选择） |
+|---|---|---|
+| 追加一条 | 读全文件 → 追加 → **整个写回** | `mode="a"` **只在末尾追加一行** |
+| 中途崩了 | 整个历史一起坏 | 最多丢最后一行 |
+| 坏了一行 | 整个文件读不出来 | 跳过那行，继续读 |
+| 读的时候 | `json.load` 整个文件 | 逐行 `loads`，可以流式处理 |
+
+**这是数据安全考虑，不是性能考虑。** 思路和 git 的 append-only 日志一样。
+
+每行包一层 `{"type": ...}` 信封，是为了同一文件里以后能混进 `compact`（上下文压缩）、`meta` 之类的行，
+读的时候 `if row["type"] == "message"` 就能筛出来 —— 加新类型不用改老文件格式。
+
+### 一个容易想不通的点
+
+文件第 1 行存了 system，磁盘上明明已经有了，为什么 `messages()` 读回时还要**再补一条** `{"role":"system"}`？
+
+因为**模型只认你发给它的 `messages` 列表，它看不到磁盘上的任何文件。**
+文件里的 system 是「存档」（给人看的），`self.messages[0]` 的 system 是「现场」（要发给模型的）。
+少了这一步，模型仍然记得你说过的话（user/assistant 都在），但它的**身份和说话风格会突然变回默认值**。
 
 ## 加一个新工具要做什么
 
@@ -132,5 +167,19 @@ uv run python cli.py --tools     # 【第 2 周】交互模式 + 工具
   > 上面两条「被拒」是**工具层强制**的，与模型自己愿不愿意调无关。
   > 实测模型有时会主动拒绝危险请求，但那是它「觉得」不安全，不是「不能」——
   > **安全必须由工具层兜底，不能指望模型自觉。**
-- [ ] 第 3 周：会话持久化 + 上下文裁剪 + 长期记忆
+- [x] **第 3 周**：`agent/session.py`，程序重启能接着聊（v0.4）
+  - [x] `agent/session.py` —— JSONL 读写（`append()` / `messages()` 两处 TODO 已补齐）
+  - [x] `loop.py` —— `load_session()` / `flush_session()` + `_flushed` 计数器
+  - [x] `cli.py` —— `--sessions` / `--resume` / `--new-session` + `/history`
+  - [x] `data/` 已进 `.gitignore`（`git check-ignore -v` 验证命中）
+  - [x] 重启程序后能接着上次聊（实测 3 次启动，输入 token 28 → 56 → **75**）
+  - [x] 坏行只坏一行（注入非法 JSON，后续内容完好）
+  - [x] `tool_calls` / `tool_call_id` 往返不丢
+  - [x] `flush_session()` 不重复写（无新消息时文件字节数不变）
+  - [ ] **上下文裁剪 `agent/context.py`**
+  - [ ] **长期记忆 `agent/memory.py`**
+  - [ ] **配置化 `agent/config.py`**
+
+  > `reset()` 故意**不**清磁盘文件：文件是历史流水账，不是聊天窗口。
+  > 清空窗口 ≠ 删除聊天记录 —— 所以 `/reset` 后接着写，旧记录仍在。
 - [ ] 第 4 周：HTTP 接口 + 测试 + 打包
