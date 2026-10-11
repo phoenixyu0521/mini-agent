@@ -40,16 +40,16 @@
       "default": "fast",
       "profiles": {
         "fast": {
-          "base_url": "https://open.bigmodel.cn/api/paas/v4",
-          "model": "glm-4.7-flash",
+          "base_url": "https://maas.qianwenaiapi.com/compatible-mode/v1",
+          "model": "deepseek-v4.1-flash",
           "max_tokens": 2048,
-          "timeout": 30
-        },
-        "deepseek": {
-          "base_url": "https://api.deepseek.com/v1",
-          "model": "deepseek-v4-flash",
-          "max_tokens": 8192,
           "timeout": 60
+        },
+        "smart": {
+          "base_url": "https://maas.qianwenaiapi.com/compatible-mode/v1",
+          "model": "deepseek-v4-pro",
+          "max_tokens": 8192,
+          "timeout": 90
         }
       }
     }
@@ -59,16 +59,34 @@
 
 ## 优先级（这个顺序要想清楚）
 
-    命令行 --profile deepseek   ← 最高，本次启动说了算
+    命令行 --profile smart       ← 最高，本次启动说了算
     环境变量 LLM_PROFILE         ← 次之，可以写进 shell 脚本
     config.json 的 default       ← 兜底
-    内置常量 "default"           ← 最后兜底（config.json 里连 default 都没写）
+    内置常量 DEFAULT_PROFILE     ← 最后兜底（config.json 里连 default 都没写）
+
+## ⚠️ 已知局限（2026-10-11 真实验证暴露）
+
+**一个 profile 只有 base_url，没有 Key —— 所以一个 Key 只能配一家厂商。**
+
+现在 `api_key` 是从 `LLM_API_KEY` 全局读的（见 resolve() 的 TODO ②），
+而 `base_url` 是每个 profile 一份。这带来一个说不通的组合：
+
+    想放「中转站」和「智谱官方」两个档案 → 做不到，因为只有一个 Key
+
+更要命的是**失败信息具有误导性**：地址指向 A 家、Key 是 B 家的，
+报错是 401「令牌已过期或验证不正确」。你会以为是 Key 过期了，
+去后台翻半天，其实是自己把两家的东西拼在了一起。
+
+**修法（第 4 周做）**：profile 里加 `api_key_env` 字段，指向不同的环境变量名：
+
+    "zhipu": { "base_url": "...", "api_key_env": "ZHIPU_API_KEY", ... }
 
 ## 边界
 
     ✅ 一个 config.json 存多套预设，命令行切换
     ✅ 配置进 Git，凭据留在 .env
-    ❌ 不做「运行时热切换」—— 换 profile 要重启程序。这一块够用就行
+    ❌ 一个 Key 只能配一家厂商（见上面的已知局限）
+    ❌ 不做「运行时热切换」—— 换 profile 要重启程序
 """
 
 from __future__ import annotations
@@ -78,6 +96,17 @@ import os
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
+
+# ⚠️ 这一行不是多余的。
+# 为什么 config.py 自己也要 load_dotenv()，明明 llm.py 已经调过了？
+#     因为「模块不该依赖别的模块碰巧做过什么初始化」。
+#     之前它跑得通，只是因为 cli.py 恰好先 import 了 llm —— 一旦有人
+#     单独 `from agent import config`（比如写单测），就取不到 .env 里的 Key。
+#     这类「靠运气成立的隐式依赖」是最难查的一类 bug。
+#     load_dotenv() 是幂等的，重复调用没有副作用。
+load_dotenv()
+
 # config.json 放项目根目录（和 README 同级）——
 # 因为它「属于项目」，应该能进 Git，也应该让人一眼看到。
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
@@ -85,19 +114,26 @@ CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
 # 内置兜底。为什么需要它？
 #     如果 config.json 不存在（比如刚 clone 下来还没建），程序不该直接崩 ——
 #     它会退回这套最保守的默认值，至少能跑起来。
-#     ⚠️ 但注意：这里**不放 base_url 和 model**，见下面的 DEFAULT_BASE_URL 说明。
-DEFAULT_PROFILE = "default"
+DEFAULT_PROFILE = "fast"
 DEFAULT_MAX_TOKENS = 2048
-DEFAULT_TIMEOUT = 30
+DEFAULT_TIMEOUT = 60
 
-# 内置的默认接口地址。
-# 为什么这个可以写进代码，而 API Key 不行？
-#     因为它不是秘密 —— 它是公开的、所有用智谱的人都知道的地址。
-#     把它写进来，能让「config.json 还没建」的新用户开箱即用。
-DEFAULT_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
-DEFAULT_MODEL = "glm-4.7-flash"
+# 内置的默认接口地址和模型。
+# 为什么这两个可以写进代码，而 API Key 不行？
+#     因为它们不是秘密 —— 地址和模型名是公开的。
+#     写进来能让「config.json 还没建」时程序依然可用。
+#
+# ⚠️ 2026-10-11 教训：这里的值必须和 config.json 里的**实际可用组合**一致。
+#     初版写的是智谱官方地址 + glm-4.7-flash，但本项目用的 Key 是中转站的，
+#     两者不配套 → 401「令牌已过期或验证不正确」。
+#     另外 deepseek-v4-flash 这个名字已从中转站下线，要用 deepseek-v4.1-flash。
+#     **地址、模型名、Key 三者必须来自同一家厂商** —— 这是配置化最容易踩的坑。
+DEFAULT_BASE_URL = "https://maas.qianwenaiapi.com/compatible-mode/v1"
+DEFAULT_MODEL = "deepseek-v4.1-flash"
 
-# 配置文件不存在时，自动创建这个内容（含两套示例预设）。
+# 配置文件不存在时，自动创建这个内容。
+# 它和仓库里的 config.json **刻意保持一致** —— 这样「删掉后自动重建」
+# 得到的仍是一份能跑通的配置。
 TEMPLATE: dict[str, Any] = {
     "default": "fast",
     "profiles": {
@@ -105,13 +141,13 @@ TEMPLATE: dict[str, Any] = {
             "base_url": DEFAULT_BASE_URL,
             "model": DEFAULT_MODEL,
             "max_tokens": 2048,
-            "timeout": 30,
-        },
-        "deepseek": {
-            "base_url": "https://api.deepseek.com/v1",
-            "model": "deepseek-v4-flash",
-            "max_tokens": 8192,
             "timeout": 60,
+        },
+        "smart": {
+            "base_url": DEFAULT_BASE_URL,
+            "model": "deepseek-v4-pro",
+            "max_tokens": 8192,
+            "timeout": 90,
         },
     },
 }
@@ -208,7 +244,31 @@ class Config:
 #      （提示：想想这两个文件一个进 Git、一个不进 Git）
 # ─────────────────────────────────────────────────────────────
 def load_raw() -> dict[str, Any]:
-    raise NotImplementedError("TODO ① 还没补：load_raw() 还没实现")
+    # 1) 文件不存在就自动创建（用 TEMPLATE）
+    if not CONFIG_PATH.exists():
+        CONFIG_PATH.write_text(
+            json.dumps(TEMPLATE, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    # 2) 读 + 解析。用户手编 JSON 时多一个逗号很常见
+    text = CONFIG_PATH.read_text(encoding="utf-8")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(
+            f"config.json 格式不对（第 {exc.lineno} 行）：{exc.msg}\n"
+            f"检查 {CONFIG_PATH}"
+        ) from exc
+
+    # 3) 校验最外层结构 —— 宁可在门口拦下
+    if not isinstance(data, dict):
+        raise ConfigError(f"config.json 的最外层必须是一个对象 {{...}}，实际是 {type(data).__name__}")
+    if not isinstance(data.get("profiles"), dict):
+        raise ConfigError('config.json 里必须有 "profiles" 字段，且它是个对象')
+
+    return data
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -254,7 +314,43 @@ def load_raw() -> dict[str, Any]:
 #      （提示：想想如果用户只是把 profile 名字拼错了，应该先告诉他哪一个错）
 # ─────────────────────────────────────────────────────────────
 def resolve(name: str | None = None) -> Config:
-    raise NotImplementedError("TODO ② 还没补：resolve() 还没实现")
+    data = load_raw()
+    profiles = data["profiles"]
+
+    # a) 决定用哪个 profile —— 优先级从高到低
+    chosen = name or os.environ.get("LLM_PROFILE") or data.get("default") or DEFAULT_PROFILE
+
+    # b) 找它。找不到要列出手上有哪些
+    if chosen not in profiles:
+        available = "、".join(sorted(profiles))
+        raise ConfigError(
+            f'config.json 里没有名为 "{chosen}" 的 profile。'
+            f"可用的有：{available}。"
+        )
+
+    preset = profiles[chosen]
+    if not isinstance(preset, dict):
+        raise ConfigError(f'profile "{chosen}" 必须是一个对象，实际是 {type(preset).__name__}')
+
+    # c) 四个值都给兜底
+    preset_data = {
+        "base_url": preset.get("base_url") or DEFAULT_BASE_URL,
+        "model": preset.get("model") or DEFAULT_MODEL,
+        "max_tokens": int(preset.get("max_tokens") or DEFAULT_MAX_TOKENS),
+        "timeout": int(preset.get("timeout") or DEFAULT_TIMEOUT),
+    }
+
+    # d) API Key —— 唯一绝不兜底的一项
+    api_key = os.environ.get("LLM_API_KEY") or ""
+    if not api_key.strip() or "请替换" in api_key:
+        raise ConfigError(
+            "缺少 LLM_API_KEY。请把 .env.example 复制成 .env，"
+            "填上你自己的 Key（.env 不会进 Git）。"
+        )
+
+    # e) 组装
+    return Config(profile=chosen, data=preset_data, api_key=api_key)
+
 
 
 # ── 调试用 ──────────────────────────────────────────────────
@@ -265,11 +361,10 @@ def list_profiles() -> list[str]:
     给 `cli.py --profiles` 用。为什么这个不用留 TODO？
         因为它只是「读文件 + 取 keys + 排序」，纯脚手架，没有原理。
 
-    ⚠️ 这里**故意连 NotImplementedError 一起捕**：
-        因为 load_raw() 是 TODO ① —— 它还没被补上时，这个函数不能让程序崩。
-        宁可返回空列表让上层打印「还没有任何 profile」，
-        也不要让用户看到一个他没写过的异常。
-        （同样地，抛错也不该外抛 —— 这个函数的语义就是「列不出来就列不出来」。）
+    ⚠️ 为什么连 NotImplementedError 也一起捕？
+        这是骨架阶段留下的防御 —— 当时 load_raw() 还是 TODO，未补时会抛它。
+        现在两处 TODO 都补完了，理论上捕不到，**但留着不亏**：
+        将来若又新增未实现的函数，这个入口仍不会崩，只会安静地列不出来。
     """
     try:
         data = load_raw()

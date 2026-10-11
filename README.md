@@ -282,7 +282,7 @@ nanobot 用 **Dream** 定时任务补上这一步（额外一次模型调用去�
 
 ```bash
 uv run python cli.py --profiles          # 看有哪些配置档案
-uv run python cli.py --profile deepseek "你好"   # 换一套配置跑，代码一行不改
+uv run python cli.py --profile smart "你好"      # 换一套配置跑，代码一行不改
 ```
 
 `config.json` 里存着几套预设：
@@ -291,8 +291,8 @@ uv run python cli.py --profile deepseek "你好"   # 换一套配置跑，代码
 {
   "default": "fast",
   "profiles": {
-    "fast":     { "base_url": "...", "model": "glm-4.7-flash",    "max_tokens": 2048, "timeout": 30 },
-    "deepseek": { "base_url": "...", "model": "deepseek-v4-flash", "max_tokens": 8192, "timeout": 60 }
+    "fast":  { "base_url": "...", "model": "deepseek-v4.1-flash", "max_tokens": 2048, "timeout": 60 },
+    "smart": { "base_url": "...", "model": "deepseek-v4-pro",     "max_tokens": 8192, "timeout": 90 }
   }
 }
 ```
@@ -335,6 +335,42 @@ config.json 的 default   ← 兜底
 **2. 打印配置时不显示 Key。** `Config.__repr__()` 和 `summary()` 都把 Key 掩码成
 `abc123...wxyz`。因为**凭据泄露最常见的路径就是日志** —— 你 `print(config)` 调试一下，
 Key 就出现在终端里，然后可能被粘进 issue、截图、聊天记录。
+
+### ⚠️ 真实踩坑：地址、模型名、Key 必须是同一家
+
+骨架交付后第一次跑，直接 401「令牌已过期或验证不正确」。**两个独立的问题**：
+
+| # | 问题 | 现象 |
+|---|---|---|
+| 1 | `config.json` 的 `base_url` 写的是智谱官方，但 Key 是中转站的 | 401 |
+| 2 | `deepseek-v4-flash` 已从中转站下线（改名 `deepseek-v4.1-flash`） | 404 `Model not exist` |
+
+**教训一：三者必须配套。** 配置化把 `base_url` 从 `.env` 搬进 `config.json` 时，
+如果用了一个「通用示例地址」，就会和用户实际的 Key 不匹配。
+而报错信息是 401 —— **看起来像 Key 过期，实际是拼错了厂商**。误导性极强。
+
+排查手法（值得记住）：用 raw HTTP 直接打一次，看**到底是 401 还是别的**：
+
+```python
+httpx.post(base + "/chat/completions",
+           headers={"Authorization": "Bearer " + key},
+           json={"model": model, "messages": [{"role": "user", "content": "hi"}]})
+# 401 → 认证问题（Key / 地址不匹配）
+# 404 model_not_found → 认证已过，是模型名不对
+# 200 → 通了
+```
+
+**拿到 404 而不是 401 是个好消息** —— 说明认证已经通过，Key 是有效的，
+只是模型名写错了。这一步能省掉「去后台翻 Key 是不是过期了」的半小时。
+
+还可以先拉一次模型清单，看手上这个 Key 到底能调哪些：
+
+```python
+httpx.get(base + "/models", headers={"Authorization": "Bearer " + key}).json()["data"]
+```
+
+**教训二：模型名会下线。** `deepseek-v4-flash` 以前能用，现在没了。
+所以「配置化」除了方便，还有个隐性价值：**换模型不用改代码，改一行 JSON 就行。**
 
 ### 一个「保持接口稳定」的实例
 
@@ -410,7 +446,7 @@ Key 就出现在终端里，然后可能被粘进 issue、截图、聊天记录�
   > 你曾经 `/resume` 回去却答不出名字 —— 那次是**新会话**，
   > 而且「名字」这种东西永不变，不该靠每次压缩去赌它还在不在。
 - [x] **配置化 `agent/config.py`**：改 JSON 换模型，不用改代码（v0.7）
-  - [ ] `agent/config.py` —— `load_raw()` / `resolve()`（两处 TODO 待补）
+  - [x] `agent/config.py` —— `load_raw()` / `resolve()`（两处 TODO 已补齐）
   - [x] `config.json` —— `fast` / `deepseek` 两套预设，**进 Git**
   - [x] `llm.py` —— `load_config()` 改为包装 `config.resolve()`，**三个调用方一行未改**
   - [x] `.env.example` 精简为「只剩 API Key」（模型参数已搬去 config.json）

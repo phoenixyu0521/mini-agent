@@ -2,16 +2,16 @@
   "default": "fast",
   "profiles": {
     "fast": {
-      "base_url": "https://open.bigmodel.cn/api/paas/v4",
-      "model": "glm-4.7-flash",
+      "base_url": "https://maas.qianwenaiapi.com/compatible-mode/v1",
+      "model": "deepseek-v4.1-flash",
       "max_tokens": 2048,
-      "timeout": 30
-    },
-    "deepseek": {
-      "base_url": "https://api.deepseek.com/v1",
-      "model": "deepseek-v4-flash",
-      "max_tokens": 8192,
       "timeout": 60
+    },
+    "smart": {
+      "base_url": "https://maas.qianwenaiapi.com/compatible-mode/v1",
+      "model": "deepseek-v4-pro",
+      "max_tokens": 8192,
+      "timeout": 90
     }
   }
 }
