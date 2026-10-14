@@ -104,7 +104,9 @@ def get_agent(session_id: str) -> AgentLoop:
                   真实系统会给它加 TTL 过期，或者只在内存里放「活跃会话」。
     ─────────────────────────────────────────────────────────
     """
-    raise NotImplementedError("TODO ② 还没补：get_agent() 会话池还没实现")
+    if session_id not in _agents:
+        _agents[session_id] = _build_agent(session_id)
+    return _agents[session_id]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -169,31 +171,22 @@ async def info() -> dict[str, Any]:
 async def chat(req: ChatRequest) -> dict[str, Any]:
     agent = get_agent(req.session_id)
 
-    # ─────────────────────────────────────────────────────────
-    # TODO ③ —— 让这次调用「不堵住事件循环」
+    # 把同步调用丢进线程池，别堵住事件循环。
     #
-    # 直接写   reply = agent.run(req.message)   是能跑的，但有问题：
-    #   agent.run() 内部是同步的 httpx.post —— 它会卡住当前线程。
-    #   FastAPI 跑在**单个事件循环**上，卡住它 = 所有其他请求都得排队，
-    #   包括刷新页面这种跟对话无关的请求。多用户时就是「一个人说话，
-    #   所有人卡住」。
+    # 为什么必须这样？agent.run() 内部是同步的 httpx.post —— 它一开跑就在
+    # 当前线程上死等网络。而 FastAPI 只有**一个事件循环线程**，
+    # 堵住它 = 所有请求排队（包括刷新页面），多用户时就是
+    # 「一个人说话，所有人卡住」。
     #
-    # 解法：把同步函数丢进**线程池**，让事件循环继续转：
-    #
-    #     loop = asyncio.get_running_loop()
-    #     reply = await loop.run_in_executor(None, agent.run, req.message)
-    #
-    #   ↑ run_in_executor 的三个参数：线程池（None = 用默认的）、
-    #     要调的函数、函数的位置参数。它返回一个**可等待对象**，必须 await。
-    #
-    # 想一想：为什么这样就「不堵」了？
-    #     提示：httpx.post 在**另一个线程**里等网络，
-    #           事件循环那个线程就被空出来接待新请求了。
-    # ─────────────────────────────────────────────────────────
+    # run_in_executor 三个参数：线程池（None = 默认的）、要调的函数
+    # （**只写函数名不加括号**）、它的位置参数。返回可等待对象，必须 await。
+    # 效果：httpx.post 在另一个线程里等，事件循环那个线程空出来接待新请求。
+    loop = asyncio.get_running_loop()
+    reply = await loop.run_in_executor(None, agent.run, req.message)
 
     return {
         "session_id": req.session_id,
-        "reply": reply.text if hasattr(reply, "text") else str(reply),
+        "reply": reply,
         "usage": agent.last_usage,
         "compact_count": agent.compact_count,
     }
