@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mini-agent</title>
+<style>
+:root{
+  --bg:#fff; --panel:#f7f7f8; --border:#e4e4e7; --text:#18181b; --muted:#71717a;
+  --user-bg:#2563eb; --user-fg:#fff; --ai-bg:#f2f2f4; --ai-fg:#18181b; --accent:#2563eb;
+}
+@media (prefers-color-scheme:dark){
+:root{
+  --bg:#18181b; --panel:#1f1f23; --border:#303036; --text:#e8e8ec; --muted:#8b8b94;
+  --user-bg:#2563eb; --user-fg:#fff; --ai-bg:#28282e; --ai-fg:#e8e8ec; --accent:#60a5fa;
+}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{display:flex;font:14px/1.65 system-ui,"Segoe UI","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text)}
+button{font:inherit;cursor:pointer;border:1px solid var(--border);background:var(--bg);color:var(--text);border-radius:8px;padding:6px 12px}
+button:hover{border-color:var(--accent);color:var(--accent)}
+#side{width:232px;flex:0 0 232px;background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;min-height:0}
+.side-head{display:flex;align-items:center;justify-content:space-between;padding:14px 14px 10px}
+.side-head b{font-size:14px;font-weight:500}
+#newBtn{padding:2px 9px;font-size:16px;line-height:1.2}
+#sessions{flex:1;overflow-y:auto;padding:0 8px 8px}
+.sitem{padding:8px 10px;border-radius:8px;cursor:pointer;margin-bottom:2px}
+.sitem:hover{background:var(--bg)}
+.sitem.on{background:var(--bg);box-shadow:inset 2px 0 0 var(--accent)}
+.sitem .t{font-size:13px}
+.sitem .s{font-size:11px;color:var(--muted)}
+.side-foot{padding:10px 14px;border-top:1px solid var(--border);font-size:11px;color:var(--muted);line-height:1.5}
+main{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
+header{display:flex;align-items:center;gap:10px;padding:12px 18px;border-bottom:1px solid var(--border);font-size:12px;color:var(--muted)}
+header .dot{width:6px;height:6px;border-radius:50%;background:var(--accent);flex:0 0 6px}
+header code{font-size:12px;background:var(--ai-bg);padding:1px 6px;border-radius:5px;color:var(--text)}
+#messages{flex:1;overflow-y:auto;padding:22px 18px 8px;display:flex;flex-direction:column;gap:14px}
+.row{display:flex}
+.row.user{justify-content:flex-end}
+.bubble{max-width:min(680px,78%);padding:10px 14px;border-radius:14px;white-space:pre-wrap;word-break:break-word}
+.user .bubble{background:var(--user-bg);color:var(--user-fg);border-bottom-right-radius:4px}
+.ai .bubble{background:var(--ai-bg);color:var(--ai-fg);border-bottom-left-radius:4px}
+.bubble.err{background:#fee;color:#a11;border:1px solid #fcc}
+@media (prefers-color-scheme:dark){.bubble.err{background:#3a1d1d;color:#f8b4b4;border-color:#5a2a2a}}
+.caret{display:inline-block;width:7px;height:14px;background:var(--accent);vertical-align:-2px;animation:blink 1s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+#inputWrap{display:flex;gap:10px;align-items:flex-end;padding:12px 18px 16px;border-top:1px solid var(--border)}
+#input{flex:1;resize:none;font:inherit;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);max-height:160px;outline:none}
+#input:focus{border-color:var(--accent)}
+#send{background:var(--user-bg);color:#fff;border-color:var(--user-bg);padding:9px 18px}
+#send:disabled{opacity:.5;cursor:default}
+</style>
+</head>
+<body>
+
+<div id="side">
+  <div class="side-head"><b>mini-agent</b><button id="newBtn" title="开新会话">＋</button></div>
+  <div id="sessions"></div>
+  <div class="side-foot" id="foot">加载中…</div>
+</div>
+
+<main>
+  <header>
+    <span class="dot"></span>
+    <span id="model">…</span>
+    <code id="sid"></code>
+  </header>
+  <div id="messages"></div>
+  <div id="inputWrap">
+    <textarea id="input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+    <button id="send">发送</button>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let sessionId = null;
+let busy = false;
+
+function fmtId(id) {
+  // 20261011-143000 → 10-11 14:30
+  const m = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})/.exec(id || "");
+  return m ? `${m[2]}-${m[3]} ${m[4]}:${m[5]}` : (id || "");
+}
+
+function scrollDown() {
+  const box = $("messages");
+  box.scrollTop = box.scrollHeight;
+}
+
+function clearMessages() { $("messages").innerHTML = ""; }
+
+function addBubble(role, text) {
+  const row = document.createElement("div");
+  row.className = "row " + (role === "user" ? "user" : "ai");
+  const b = document.createElement("div");
+  b.className = "bubble";
+  b.textContent = text;
+  row.appendChild(b);
+  $("messages").appendChild(row);
+  scrollDown();
+  return b;
+}
+
+function renderSessions(list) {
+  const box = $("sessions");
+  box.innerHTML = "";
+  if (!list.length) {
+    box.innerHTML = '<div class="sitem"><div class="s">还没有会话，点右上角 ＋ 开一个</div></div>';
+    return;
+  }
+  list.forEach((s) => {
+    const el = document.createElement("div");
+    el.className = "sitem" + (s.id === sessionId ? " on" : "");
+    el.innerHTML = `<div class="t">${fmtId(s.id)}</div>
+                    <div class="s">${s.message_count || 0} 条消息</div>`;
+    el.onclick = () => openSession(s.id);
+    box.appendChild(el);
+  });
+}
+
+async function loadInfo() {
+  const info = await (await fetch("/api/info")).json();
+  $("model").textContent = info.model;
+  $("sid").textContent = info.profile;
+  $("foot").innerHTML = `${info.version} · ${info.sessions.length} 个会话`;
+  return info.sessions;
+}
+
+async function openSession(id) {
+  sessionId = id;
+  $("sid").textContent = id;
+  clearMessages();
+  try {
+    const h = await (await fetch("/api/history?session_id=" + encodeURIComponent(id))).json();
+    if (!h.messages.length) {
+      addBubble("ai", "（这个会话还没有对话内容）");
+    } else {
+      h.messages.forEach((m) => addBubble(m.role, m.content));
+    }
+  } catch (e) {
+    addBubble("ai", "[读历史失败：" + e.message + "]");
+  }
+  const info = await loadInfo();
+  renderSessions(info);
+}
+
+async function newSession() {
+  const r = await (await fetch("/api/sessions/new", { method: "POST" })).json();
+  sessionId = r.session_id;
+  $("sid").textContent = sessionId;
+  clearMessages();
+  addBubble("ai", "新会话。开始聊吧 —— 这个会话的历史会自动存到磁盘，关掉网页也还在。");
+  const info = await loadInfo();
+  renderSessions(info);
+}
+
+async function send() {
+  const input = $("input");
+  const text = input.value.trim();
+  if (!text || busy) return;
+
+  busy = true;
+  $("send").disabled = true;
+  input.value = "";
+  input.style.height = "auto";
+
+  addBubble("user", text);
+  const bubble = addBubble("ai", "");
+  const caret = document.createElement("span");
+  caret.className = "caret";
+  bubble.appendChild(caret);
+
+  let acc = "";
+  try {
+    const resp = await fetch("/api/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, message: text }),
+    });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+
+      // SSE 帧以空行分隔，最后一段可能不完整，留到下一轮
+      const frames = buf.split("\n\n");
+      buf = frames.pop();
+
+      for (const frame of frames) {
+        const line = frame.trim();
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (payload === "[DONE]") continue;
+        let obj;
+        try { obj = JSON.parse(payload); } catch { continue; }
+        if (obj.error) {
+          bubble.textContent = acc + "\n[" + obj.error + "]";
+          bubble.classList.add("err");
+        } else if (obj.text) {
+          acc += obj.text;
+          bubble.textContent = acc;
+          bubble.appendChild(caret);
+        }
+        scrollDown();
+      }
+    }
+  } catch (e) {
+    bubble.classList.add("err");
+    bubble.textContent = acc + "\n[连接失败：" + e.message + "]";
+  }
+
+  caret.remove();
+  if (!acc && !bubble.textContent) bubble.textContent = "（没有返回内容）";
+  busy = false;
+  $("send").disabled = false;
+  input.focus();
+
+  const info = await loadInfo();
+  renderSessions(info);
+}
+
+$("send").onclick = send;
+$("newBtn").onclick = newSession;
+
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$("input").addEventListener("input", (e) => {
+  e.target.style.height = "auto";
+  e.target.style.height = Math.min(e.target.scrollHeight, 160) + "px";
+});
+
+(async () => {
+  try {
+    const list = await loadInfo();
+    if (list.length) await openSession(list[0].id);
+    else await newSession();
+  } catch (e) {
+    $("foot").textContent = "连接后端失败：" + e.message;
+  }
+})();
+</script>
+</body>
+</html>

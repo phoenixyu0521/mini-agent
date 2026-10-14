@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterator
 
 from agent import context, llm
 from agent.memory import Memory
@@ -275,42 +275,54 @@ class AgentLoop:
         self.flush_session()   # 第 3 周：这一轮的对话落盘
         return reply.text
 
-    def run_stream(self, user_text: str) -> str:
-        """和 run() 做同一件事，只是边收边打印。"""
-        # ─────────────────────────────────────────────────────────
-        # TODO ② —— 同样是三步，难点在这个「拼」字
-        #
-        #   llm.stream_chat(self.messages) 是个「产出一小段、停一下、再产出一小段」的
-        #   迭代器。你可以用一个 for 循环消费它：
-        #
-        #       for piece in llm.stream_chat(self.messages):
-        #           ...
-        #
-        #   你需要做四件事：
-        #     1) 先追加 user 消息（和 TODO ① 一样）
-        #     2) 准备一个空列表碎片收集箱，比如 pieces = []
-        #        每拿到一小段：存进收集箱，同时立刻打出去
-        #            print(piece, end="", flush=True)
-        #        end="" 让它别换行，flush=True 让它立刻显示而不是攒着
-        #     3) 循环结束后，把收集箱拼成完整一句："".join(pieces)
-        #     4) 把这一整句追加进 self.messages（role="assistant"），再返回
-        #        （流式接口不返回 usage，所以 self.last_usage 这次留空就行）
-        #
-        #   为什么必须拼完整了再存？直接存 100 个小碎片不行吗？
-        #     提示：messages 的每一项必须是「一条完整消息」，
-        #           而且下一轮会把它们全部重新发出去，格式坏了模型就懵了。
-        # ─────────────────────────────────────────────────────────
+    def stream(self, user_text: str) -> Iterator[str]:
+        """和 run() 做同一件事，区别是「一小段一小段地交出来」而不是一次给完。
+
+        ⭐ 为什么第 4 周才把它从 run_stream() 里拆出来？（这是本周的第一个设计课）
+            因为以前只有终端一个使用者 —— 让 run_stream() 自己 print 就够了。
+            现在多了 Web：它**不能 print**，它要把片段打包成 SSE 发出去。
+            同一个能力，两种展示方式 → 「产出」和「展示」必须分开。
+
+            这就是那句话：**内核提供能力，入口决定怎么显示。**
+
+            拆完之后：
+                stream()      只负责「产出」（纯逻辑，不知道自己在哪被用）
+                run_stream()  只负责「打印」（终端用）
+                将来 Web 版写第三个消费者（打包成 SSE），内核一行不改
+
+        ⚠️ 顺带修掉一个第 3 周的遗漏：
+            原来的 run_stream() **从来没调过 flush_session()** ——
+            也就是说 `--stream` 模式聊完，对话**根本没落盘**，关掉就没了。
+            run() 有这个调用，run_stream() 漏了。
+            现在补上（在本方法末尾），CLI 和 Web 两条路都能正确存盘。
+
+        这个方法本身没有留 TODO —— 因为「碎片收集 + 拼完整再存」正是你第 3 周
+        亲手补过的东西（当时叫 TODO ②），这里只是把它挪个位置。
+        """
         self.messages.append({"role": "user", "content": user_text})
 
         pieces: list[str] = []
         for piece in llm.stream_chat(self._view()):
             pieces.append(piece)
+            yield piece
+
+        # 必须拼成**一整条**消息再存：下一轮会把 messages 里每一项重新发一遍，
+        # 每一项都必须是一条完整消息 —— 存 100 个碎片进去，格式就坏了。
+        self.messages.append({"role": "assistant", "content": "".join(pieces)})
+        self.flush_session()   # ← 第 3 周漏掉的那一行
+
+    def run_stream(self, user_text: str) -> str:
+        """终端用：消费 stream()，把每一段立刻打出来。
+
+        注意它自己**不含任何逻辑** —— 只是把 stream() 产出的东西显示出来。
+        这正是拆分的好处：Web 版只要写另一个消费者（打包成 SSE），内核一行不改。
+        """
+        pieces: list[str] = []
+        for piece in self.stream(user_text):
+            pieces.append(piece)
             print(piece, end="", flush=True)
         print()
-
-        reply_text = "".join(pieces)
-        self.messages.append({"role": "assistant", "content": reply_text})
-        return reply_text
+        return "".join(pieces)
 
     def reset(self) -> None:
         """清空对话内容，保留开头的 system。
