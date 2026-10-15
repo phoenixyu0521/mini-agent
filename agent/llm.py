@@ -32,6 +32,81 @@ from agent import config as _config
 load_dotenv()
 
 
+# ── 第 4 周：共享 HTTP 连接 ──────────────────────────────────
+# 改之前 chat() / stream_chat() / _summarize() 三处都用 httpx.post(...) 这种
+# 「一次性」写法 —— httpx 会在内部悄悄新建一个 Client，请求结束就把它关掉。
+#
+# 本机实测（2026-10-15）：
+#     每次新建 Client 耗时  918 ~ 1027 ms   ← 纯开销，跟模型快慢无关
+#     其中绝大部分是 SSLContext 初始化（读 ca-bundle 证书链）
+#
+# 为什么这个开销在本机特别大？httpx 默认会加载 certifi 的证书包做 TLS 校验。
+# Windows 上这一步很慢（不是 httpx 的 bug，是平台差异）。
+#
+# 修法：**一个进程共用一个 Client**，让底层连接池复用 TCP + TLS 握手。
+# 这一步只改 llm.py 一个文件 —— 铁律的真正价值就在这里，
+# 换厂商 / 换传输方式时，只有这一个文件需要重新审阅。
+#
+# 为什么用函数懒加载，而不是直接写模块级变量？
+#     import llm 是「加载代码」，不是「准备发请求」。
+#     如果写成模块级 client = httpx.Client()，那么**任何** import 到 llm 的地方
+#     （包括 cli.py 打印 --help、包括跑测试）都会白白付这 900ms。
+#     懒加载把成本推迟到「真的要发请求的那一刻」。
+#
+# 线程安全：
+#     httpx.Client 是线程安全的，server.py 用 run_in_executor 多线程调它没问题。
+#     但**不要**把 Client 传给多个不同的 base_url 之外的地方去乱改它的属性。
+_client: httpx.Client | None = None
+
+
+def get_client() -> httpx.Client:
+    """拿进程级共享的 HTTP 客户端，没有就造一个。
+
+    注意 timeout 不在这里设：
+        因为 timeout 来自 config.json，不同 profile 可能不一样。
+        设成 Client 的默认值就得在换 profile 时重建 Client，
+        而「每次请求传 timeout」是 httpx 官方支持的做法。
+    """
+    global _client
+    if _client is None:
+        _client = httpx.Client(
+            # 连接池参数全部塞在 Limits 里（httpx 0.28 的位置，不是 Client 的）。
+            #   max_connections           最多 20 条并发连接
+            #   max_keepalive_connections 最多留 5 条空闲连接备用
+            #   keepalive_expiry          空闲连接最多留 30 秒
+            #
+            # 为什么 max_connections 要从默认的 100 降下来？
+            #   默认 100 是给「代理服务器转发大量用户」设计的。
+            #   单机 Agent 一个用户，同时最多也就一两个请求，
+            #   100 条连接在服务端全是占着内存不干活的僵尸。
+            #
+            # 为什么 keepalive_expiry 要从默认的 5 秒提到 30？
+            #   推理模型思考时可能十几秒不吐字。默认 5 秒就把空闲连接掐了，
+            #   下一个请求又要重新握手 —— 连接池等于白建。
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=5,
+                keepalive_expiry=30.0,
+            ),
+        )
+    return _client
+
+
+def close_client() -> None:
+    """主动关掉共享 Client。
+
+    什么时候需要调？
+        正常跑 CLI / server 时**不需要** —— 进程退出时 socket 由操作系统回收。
+        但两种情况必须调：
+          1) 跑测试：同一进程里要换 base_url / mock 掉网络，不关会串味。
+          2) 写长期驻留的服务，想在收到退出信号时优雅关闭（释放服务端连接）。
+    """
+    global _client
+    if _client is not None:
+        _client.close()
+        _client = None
+
+
 class ConfigError(RuntimeError):
     """配置缺失，或者还是模板里的示例值。"""
 
@@ -202,7 +277,7 @@ def chat(
         模型有需要时会返回 tool_calls 而不是正文。
     """
     cfg = cfg or load_config()
-    resp = httpx.post(
+    resp = get_client().post(
         cfg["url"],
         headers=_headers(cfg),
         json=_payload(cfg, messages, stream=False, tools=tools),
@@ -252,7 +327,10 @@ def stream_chat(
         「与厂商耦合的代码只在这一个文件里」是铁律。
     """
     cfg = cfg or load_config()
-    with httpx.stream(
+    # 流式用的是 client.stream()，它返回一个上下文管理器。
+    # ⚠️ 一个容易踩的坑：如果写成 get_client().post(..., stream=True)，
+    #    响应体会一次性读完 —— 那就不叫流式了，打字机效果会消失。
+    with get_client().stream(
         "POST",
         cfg["url"],
         headers=_headers(cfg),
@@ -345,7 +423,7 @@ def make_summarizer(cfg: dict[str, Any] | None = None) -> Any:
         blob = "\n".join(lines)
 
         # 摘要是一次独立的请求。它不带 tools —— 我们只要它说话，不要它调函数。
-        resp = httpx.post(
+        resp = get_client().post(
             cfg["url"],
             headers=_headers(cfg),
             json={
