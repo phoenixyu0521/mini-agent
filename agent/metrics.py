@@ -276,6 +276,94 @@ def read_all(limit: int = 500) -> list[dict[str, Any]]:
 #   最后：avg_total_ms 该不该把失败轮排除掉？
 #       这个问题没有标准答案，取决于你要回答什么 ——
 #       但**你必须能说出你选了哪个，以及为什么**。
+#
+# ── 下面是本项目的取舍（2026-10-15 定）────────────────────
+#   四个问题的答案都写在这里了。**重点不是这四个答案本身，
+#   而是「先问清楚要回答什么问题，再选口径」这个做法。**
+#   换一个要回答的问题，口径就该换 —— 指标是工具，不是标准答案。
+#
+#   Q1 空列表 → 返回 {"turns": 0, "empty": True}。
+#       前端要能显示「还没有数据」，不能因为没数据就500。
+#       注意别返回 {} —— 空 dict 在前端看起来像「加载中」，
+#       显式的 empty 字段才能区分「无数据」和「请求失败」。
+#
+#   Q2 avg_tool_ms 分母 = **调过工具的那些轮数**。
+#       问的是「用工具时它有多慢」，不是「工具在整体里占多少」。
+#       两者差很多：20 轮里只有 2 轮用工具，除 20 会显得工具特别快，
+#       掩盖掉「这个工具本身要3 秒」的事实。
+#       顺带一提：一轮里可能调 3 次工具，平均的是**轮**不是**次**——
+#       想看单次耗时得去 /api/metrics/raw。
+#
+#   Q3 **失败轮一律排除**（分母只算成功的）。
+#       一次 HTTP 500 可能 0.3 秒就返回了，把这种快速失败算进平均，
+#       会把数字拉低，**掩盖真正的慢问题**（比如 60 秒的超时）。
+#       失败的轮不是「慢的轮」，是「坏掉的轮」，混在一起平均是错的。
+#       它们的信息在 failed 计数和 /api/metrics/raw 里，不在平均耗时里。
+#
+#   Q4 avg_model_ms 分母 = **requests**，不是 turns。
+#       一次工具调用对外算 1 轮，内部却打了 2 次模型请求。
+#       除 turns 会系统性**低估一半**——你会以为模型比实际快一倍，
+#       然后去优化一个根本不慢的地方。
+#       注意：requests 也要只数成功轮里的（与 Q3 保持同一口径）。
+#
+#   口径一致性原则：Q3 排除了失败轮，所以**所有**平均值都只在
+#   成功的轮上计算。分母混着来是最容易犯的错 —— 分子排除了、
+#   分母没排除，算出来的东西连单位都对不上。
 # ─────────────────────────────────────────────────────────────
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    raise NotImplementedError("summary() 还没写")
+    """把一批单轮账本聚合成一份汇总。口径见上方注释。
+
+    返回结构（前端 /api/metrics 面板直接吃这个 dict）：
+        turns / failed              这批日志里有几轮、其中几轮出错
+        requests / tool_calls       上游请求总数、工具调用总次数
+        prompt_tokens / completion_tokens    token 总账
+        avg_total_ms / avg_model_ms / avg_tool_ms    三个平均值（毫秒）
+        slowest_ms                  最慢的一轮（诊断时最有用的一行）
+    """
+    if not rows:
+        return {"turns": 0, "empty": True}
+
+    total = len(rows)
+
+    # ── 计数：这些是「事实」，不涉及口径，全部数 ──────────────
+    failed = sum(1 for r in rows if r.get("error"))
+    requests = sum(r.get("requests") or 0 for r in rows)
+    tool_calls = sum(r.get("tool_calls") or 0 for r in rows)
+    prompt_tokens = sum(r.get("prompt_tokens") or 0 for r in rows)
+    completion_tokens = sum(r.get("completion_tokens") or 0 for r in rows)
+
+    # ── 平均值：只在**成功的轮**上算（Q3）─────────────────────
+    ok = [r for r in rows if not r.get("error")]
+    n_ok = len(ok)
+
+    # 每个平均值的分母：分母为 0 时给 0.0 而不是崩。
+    # 为什么给 0.0 而不是 None？因为前端要直接显示，
+    # None 会变成 JS 里的 "null" 粘在文字中间。
+    def avg(key: str, denominator: int) -> float:
+        if denominator <= 0:
+            return 0.0
+        return sum(r.get(key) or 0.0 for r in ok) / denominator
+
+    # Q4：模型耗时除以请求数（不是轮数）
+    #     而 requests 也要只数成功轮里的 —— 否则口径不一致。
+    ok_requests = sum(r.get("requests") or 0 for r in ok)
+
+    # Q2：工具耗时除以「调过工具的轮数」，不是全部轮数
+    tool_turns = sum(1 for r in ok if (r.get("tool_calls") or 0) > 0)
+
+    return {
+        "turns": total,
+        "failed": failed,
+        "ok_turns": n_ok,
+        "requests": requests,
+        "tool_calls": tool_calls,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "avg_total_ms": round(avg("total_ms", n_ok), 1),
+        "avg_model_ms": round(avg("model_ms", ok_requests), 1),
+        "avg_tool_ms": round(avg("tool_ms", tool_turns), 1),
+        # ⚠️ max() 在空序列上会 ValueError，**不是**返回 0。
+        #    所以这里要单独判 —— 这是本函数里唯一一个不能靠 avg()兜底的点。
+        "slowest_ms": round(max((r.get("total_ms") or 0.0 for r in ok), default=0.0), 1),
+        "tool_turns": tool_turns,
+    }
