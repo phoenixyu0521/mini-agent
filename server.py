@@ -35,6 +35,7 @@ from pydantic import BaseModel
 
 from agent import config as config_mod
 from agent import llm
+from agent import metrics as metrics_mod
 from agent.loop import AgentLoop
 from agent.memory import Memory
 from agent.session import Session, new_session_id
@@ -284,6 +285,30 @@ async def history(session_id: str) -> dict[str, Any]:
             if m.get("role") in ("user", "assistant") and m.get("content")
         ],
     }
+
+
+@app.get("/api/metrics")
+async def metrics_summary() -> dict[str, Any]:
+    """把 turns.jsonl 聚合成一份汇总。给前端的调试面板用。
+
+    这里**故意不经过 get_agent()** —— 读指标不该在内存里造一个 AgentLoop。
+    和 /api/history 同一个理由：只读磁盘就够。
+
+    summarize() 目前还是骨架里的 NotImplementedError，
+    全局异常处理器会把它转成 503 + 人话提示，不会甩 traceback。
+    """
+    return {"summary": metrics_mod.summarize(metrics_mod.read_all(limit=500))}
+
+
+@app.get("/api/metrics/raw")
+async def metrics_raw(limit: int = 50) -> dict[str, Any]:
+    """最近 N 条原始账本。查单轮细节时用（比如「刚才那 17 秒花在哪」）。
+
+    这个端点**故意保留原始行不做聚合** ——
+    汇总会把三次工具调用平均成一个数字，而你想看的是「第三次调了多久」。
+    指标系统的通病：只有平均值，诊断问题时不够用。留一个明细出口。
+    """
+    return {"rows": metrics_mod.read_all(limit=max(1, min(limit, 500)))}
 
 
 @app.get("/api/memory")

@@ -14,9 +14,10 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any, Iterator
 
-from agent import context, llm
+from agent import context, llm, metrics
 from agent.memory import Memory
 from agent.session import Session
 from agent.tools import registry
@@ -87,6 +88,35 @@ class AgentLoop:
         self.memory = memory
         # 本轮的长期记忆消息（还没注入时是 None）
         self._memory_message: dict[str, str] | None = None
+        # 第 4 周：v0.9 可观测性。造哪台由入口决定（CLI / HTTP），
+        # 所以这里默认是「不记」—— 记不记是一种策略，不该硬编码在核心里。
+        self.meter: metrics.Meter | None = None
+
+    # ── 第 4 周：可观测性接线（脚手架，已写好）──────────────
+
+    def _new_meter(self, entry: str) -> metrics.Meter:
+        """造这一轮的计时器。
+
+        为什么单独抽一个方法？
+            因为 run() / stream() / run_with_tools() 三个入口都要造，
+            而「session_id 从哪来」对它们都一样：
+                有 session → 用它；没有（单轮模式）→ 用 "-" 占位。
+            抽出来就只写一遍。
+        """
+        sid = self.session.session_id if self.session is not None else "-"
+        return metrics.Meter(sid, entry)
+
+    def _close_meter(self, error: str | None = None) -> None:
+        """收尾：算总耗时、写盘。出错时把错误类型也记进去。
+
+        为什么错误只记**类型和消息**、不记 traceback？
+            因为 traceback 里可能带着文件路径、配置内容。
+            而日志是要长期留在磁盘上的 —— 越详细越容易在半年后成为泄露源。
+        """
+        if self.meter is None:
+            return
+        self.meter.finish(error)
+        self.meter = None
 
     def load_memory(self) -> bool:
         """读长期记忆。成功读到内容返回 True。
@@ -244,35 +274,42 @@ class AgentLoop:
         self._flushed = len(self.messages)
 
     def run(self, user_text: str) -> str:
-        """走完一轮，返回模型回复。"""
-        # ─────────────────────────────────────────────────────────
-        # TODO ① —— 补三行，然后删掉下面的 raise
-        #
-        #   1) 把用户这句话追加进 self.messages
-        #        格式：{"role": "user", "content": user_text}
-        #   2) 调 llm.chat(self.messages)，它返回一个 Reply 对象
-        #        （正文在 .text，token 账在 .usage）
-        #   3) 把模型的回复也追加进 self.messages，role 要用 "assistant"
-        #   4) 把 reply.usage 存进 self.last_usage，再把正文返回出去
-        #        （没有第 4 步，终端就打不出 token 用量）
-        #
-        #   动手前先回答两个问题 —— 答不上来就还不该动手：
-        #
-        #   Q1：第 3 步为什么必须做？只做 1、2 步会怎样？
-        #       提示：第 2 步每一次发出去的，是整个 self.messages。
-        #
-        #   Q2：能不能在 __init__ 里就把 user 和 assistant 这两条也提前塞好？
-        #       为什么不行？
-        # ─────────────────────────────────────────────────────────
-        self.messages.append({"role": "user", "content": user_text})
+        """走完一轮，返回模型回复。
 
-        # 第 3 周：发出去的是「视图」不是「全量」。
-        # 之前三周这两个是同一个东西，现在可能不同了 —— 见 _view() 的注释。
-        reply = llm.chat(self._view())
+        第 4 周加了可观测性。这里新增的五行都是**脚手架**，直接给：
+            self.meter = self._new_meter("chat")   开工
+            with self.meter.phase("prepare"): ...  分段计时
+            self.meter.count_request(reply.usage) 记一次上游请求
+            self._close_meter()                    收尾（必须在 finally 里）
 
-        self.messages.append({"role": "assistant", "content": reply.text})
-        self.last_usage = reply.usage
-        self.flush_session()   # 第 3 周：这一轮的对话落盘
+        ⚠️ 唯一需要你想明白的是**为什么 _close_meter 放在 finally**：
+            模型请求失败（401、超时）时如果不收尾，这一轮的耗时和错误就丢了 ——
+            而**失败的那些轮恰恰是你最想看的**。
+            这就是「异常路径也要留痕」：try/finally 里的 finally 就是干这个的。
+        """
+        self.meter = self._new_meter("chat")
+        try:
+            self.messages.append({"role": "user", "content": user_text})
+
+            # prepare 段：算视图（可能触发压缩 → 压缩自己也要调一次模型）
+            with self.meter.phase("prepare"):
+                view = self._view()
+                if self.compact_count and "compact_saving" not in self.meter.m.extra:
+                    self.meter.note_compress(self.last_compact_saving)
+
+            # model 段：真正等网络的地方
+            with self.meter.phase("model"):
+                reply = llm.chat(view)
+            self.meter.count_request(reply.usage)
+
+            self.messages.append({"role": "assistant", "content": reply.text})
+            self.last_usage = reply.usage
+            self.flush_session()   # 第 3 周：这一轮的对话落盘
+        except Exception as exc:  # noqa: BLE001
+            self._close_meter(f"{type(exc).__name__}: {exc}")
+            raise
+        else:
+            self._close_meter()
         return reply.text
 
     def stream(self, user_text: str) -> Iterator[str]:
@@ -298,18 +335,47 @@ class AgentLoop:
 
         这个方法本身没有留 TODO —— 因为「碎片收集 + 拼完整再存」正是你第 3 周
         亲手补过的东西（当时叫 TODO ②），这里只是把它挪个位置。
+
+        ⚠️ 第 4 周加的计时器**只包住模型等待那一段**，
+            故意不包 `self._view()`：
+            压缩要额外调一次模型，把它算进「流式耗时」会误导 ——
+            你会以为打字机本身变慢了，其实是压缩在花时间。
         """
         self.messages.append({"role": "user", "content": user_text})
 
-        pieces: list[str] = []
-        for piece in llm.stream_chat(self._view()):
-            pieces.append(piece)
-            yield piece
+        # 视图单独算（可能触发压缩）。**不计时** —— 见下面的注释。
+        view = self._view()
 
-        # 必须拼成**一整条**消息再存：下一轮会把 messages 里每一项重新发一遍，
-        # 每一项都必须是一条完整消息 —— 存 100 个碎片进去，格式就坏了。
-        self.messages.append({"role": "assistant", "content": "".join(pieces)})
-        self.flush_session()   # ← 第 3 周漏掉的那一行
+        # stream() 自己造计时器（而不是让调用方造）——
+        # 因为它是**生成器**：函数体在第一次 next() 时才执行，
+        # 如果计时器由调用方在 for 之前造，中间任何异常都会绕过收尾。
+        # 生成器里 self-close 更难保证，所以选择「造+收都在里面」。
+        self.meter = self._new_meter("stream")
+        pieces: list[str] = []
+        try:
+            # 流式的计时段只包住「收到片段」这段时间。
+            # ⚠️ 这里**故意不包 self._view()**：
+            #     压缩要额外调一次模型，把它算进「流式耗时」会误导 ——
+            #     你会以为打字机本身变慢了，其实是压缩在花那几秒。
+            #     两件事必须分开归因，否则指标会骗人。
+            with self.meter.phase("model"):
+                for piece in llm.stream_chat(view):
+                    pieces.append(piece)
+                    yield piece
+            # 流式接口不返回 usage（SSE 里没有 usage 帧），
+            # 所以只记「请求了几次」，token 账对流式来说是未知的 ——
+            # 这是一个**诚实的缺口**，比编一个假数字强。
+            self.meter.count_request(None)
+
+            # 必须拼成**一整条**消息再存：下一轮会把 messages 里每一项重新发一遍，
+            # 每一项都必须是一条完整消息 —— 存 100 个碎片进去，格式就坏了。
+            self.messages.append({"role": "assistant", "content": "".join(pieces)})
+            self.flush_session()   # ← 第 3 周漏掉的那一行
+        except Exception as exc:  # noqa: BLE001
+            self._close_meter(f"{type(exc).__name__}: {exc}")
+            raise
+        else:
+            self._close_meter()
 
     def run_stream(self, user_text: str) -> str:
         """终端用：消费 stream()，把每一段立刻打出来。
@@ -363,6 +429,26 @@ class AgentLoop:
         if self.tools is None:
             raise RuntimeError("没有启用工具。构造时要用 AgentLoop(with_tools=True)")
 
+        # 第 4 周：这一轮是「多步」的，所以它的账比run() 复杂得多 ——
+        # requests 会是2、3、4…（每调一次工具就多一次模型往返）。
+        # 这正是要观测的数字：**一次用户请求内部到底打了几次模型**。
+        self.meter = self._new_meter("tools")
+        try:
+            return self._tools_loop(user_text, max_iterations)
+        except Exception as exc:  # noqa: BLE001
+            self._close_meter(f"{type(exc).__name__}: {exc}")
+            raise
+        finally:
+            self._close_meter()
+
+    def _tools_loop(self, user_text: str, max_iterations: int) -> str:
+        """工具循环的本体。计时在调用方 run_with_tools() 里管，这里只管逻辑。
+
+        为什么把循环单独抽成一个方法？
+            因为 run_with_tools() 现在要做三件事：开工、收尾（含 try/finally）、
+            跑逻辑。三件事混在一个方法里，try 块会包住一大段，
+            你会看不出「哪一段真的需要 try 保护」。
+        """
         # 第 1 件事和第 1 周完全一样：把用户这句话追加进去。
         self.messages.append({"role": "user", "content": user_text})
 
@@ -374,7 +460,10 @@ class AgentLoop:
             # 和第 1 周是同一件事，只是列表里现在会多出 tool_calls 和 tool 两种消息。
             # ⚠️ 注意这里每轮都重算 _view() —— 因为工具结果刚追加进去，
             #    列表变长了，视图也该跟着变。（压缩判断是幂等的，代价很小）
-            reply = llm.chat(self._view(), tools=schemas)
+            with self.meter.phase("model") if self.meter else nullcontext():
+                reply = llm.chat(self._view(), tools=schemas)
+            if self.meter is not None:
+                self.meter.count_request(reply.usage)
 
             # ─────────────────────────────────────────────────────────
             # TODO ① —— 它没要求调工具，说明这轮聊完了
@@ -429,7 +518,12 @@ class AgentLoop:
 
             for tc in reply.tool_calls:
                 args = tc.parsed_arguments()
-                result = self.tools.call(tc.name, args)
+                # 工具执行单独计时：它是**本地**耗时（毫秒级），
+                # 和模型等待（秒级）差三个数量级。混在一起平均就看不出问题了。
+                with self.meter.phase("tool") if self.meter else nullcontext():
+                    result = self.tools.call(tc.name, args)
+                if self.meter is not None:
+                    self.meter.m.tool_calls += 1
                 self.messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": result}
                 )
