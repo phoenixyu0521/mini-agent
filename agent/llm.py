@@ -444,7 +444,9 @@ def stream_chat(
                 finish_reason = choice["finish_reason"]
             delta = choice.get("delta") or {}
 
-            # 思考内容：只在计数，不产出（见下方注释）。
+            # 思考内容：只计数，不 yield 出去。
+            # 副作用是你会看到开头有几秒「什么都不动」然后文字才蹦 ——
+            # 那几秒就是模型在思考。想看见它在想什么，把下面一行改成 yield "·"。
             if delta.get("reasoning_content"):
                 reasoning_chars += len(delta["reasoning_content"])
 
@@ -454,7 +456,7 @@ def stream_chat(
                 yield piece
 
             # ═══════════════════════════════════════════════════════
-            # TODO ① —— 把这一帧的 tool_calls 分片收进 partial
+            # 把这一帧的 tool_calls 分片收进 partial
             #
             #   下面是**实测的真实帧**（2026-10-19 抓的，两个工具同时调用）：
             #
@@ -464,43 +466,32 @@ def stream_chat(
             #     帧4  index=1  id=None           name=None         args='{'
             #     帧5  index=1  id=None           name=None         args='"path": "config.json"}'
             #
-            #   照着数据写，别照直觉写。要点：
+            #   三条结论都是从数据里读出来的，不是猜的：
             #
             #     a) 每片都有 index，它决定这一片属于哪个工具
             #     b) id 和 name **只在第一片出现**，后面全是 None
-            #     c) arguments 要**逐片拼接**：'{' + '"path": "config.json"}' 
-            #        = '{"path": "config.json"}' —— 拼错了 json.loads 就炸
-            #
-            #   三个动手前该答出来的问题：
-            #
-            #   Q1. 如果某个 index 第一次出现，怎么建桶？
-            #       提示：`partial.setdefault(index, {...})` 一次搞定
-            #             「有就用、没有就建」。目录里已经留好了字段名。
-            #
-            #   Q2. id / name 后面是 None，能直接覆盖前面的值吗？
-            #       提示：看帧2 —— 如果用 `= tc.get("id")` 覆盖，
-            #             帧2 会把帧1 的 id 冲成 None，最后得到 id=None 的工具。
-            #             而 tool_call_id 是回填结果时**对号入座的唯一凭据**，
-            #             丢了它，模型看到的结果就全串了。
-            #
-            #   Q3. args 用 `=` 还是 `+=`（这里是 append 到 list）？
-            #       提示：看帧3/4/5 的 args —— 是"接着写"还是"重新写"？
-            #
-            #   （骨架已给好，把下面的 pass 换成 8 行左右的实现）
+            #        → 所以只能「非空才写」。用 `=` 直接覆盖会把 id 冲成 None，
+            #          而 tool_call_id 是回填结果时**对号入座的唯一凭据**，
+            #          丢了它，模型看到的结果就全串了。
+            #     c) arguments 要**逐片拼接**：'{' + '"path": "config.json"}'
+            #        = '{"path": "config.json"}' —— 覆盖的话只剩最后一片
             # ═══════════════════════════════════════════════════════
             for tc in delta.get("tool_calls") or []:
-                pass   # TODO ①
+                idx = tc.get("index")
+                if idx is None:
+                    continue
+                slot = partial.setdefault(idx, {"id": None, "name": None, "args": []})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["name"] = fn["name"]
+                if fn.get("arguments"):
+                    slot["args"].append(fn["arguments"])
 
-            # 推理模型还会吐 "reasoning_content"（思考过程），这里刻意丢掉它。
-            # 被丢掉的副作用是：你会看到开头有几秒停顿，然后文字才开始蹦。
-            # 想观察它在想什么，把下面两行取消注释：
-            # if delta.get("reasoning_content"):
-            #     yield "·"
-
-        # ═══════════════════════════════════════════════════════════
-        # TODO ② —— 把 partial 还原成 list[ToolCall]，交给 outcome
+        # ── 把碎片还原成 ToolCall ──────────────────────────────
         #
-        #   要做的三件事：
+        #   几个不那么显然的点：
         #
         #     1) 按 index **排序**后依次还原
         #        为什么要排序？字典本身无序，而工具执行顺序会影响语义
@@ -511,11 +502,8 @@ def stream_chat(
         #        注意 arguments 是**字符串**，别在这里 json.loads ——
         #        ToolCall.parsed_arguments() 才是负责解析的地方（且它能容错）
         #
-        #     3) 塞进 outcome（如果调用方给了的话）
-        #        下面几行已经写好了，你只需要把 calls 造出来：
-        #
-        #            if outcome is not None:
-        #                outcome.tool_calls = calls
+        #     3) 塞进 outcome（如果调用方给了的话）——
+        #        这就是「生成器把结论带出去」的那一步。
         #
         #   ⚠️ 一个边界：某个工具可能**一片内容都没有**（模型点了名但参数为空）。
         #      这时 id/name 有、args 是空 list → 拼出来是 ""。
@@ -524,7 +512,10 @@ def stream_chat(
         #      少一条服务商直接报「tool_calls 与 tool 消息不匹配」。
         # ═══════════════════════════════════════════════════════════
         calls: list[ToolCall] = []
-        # TODO ②
+        for idx in sorted(partial):
+            slot = partial[idx]
+            calls.append(ToolCall(id=slot["id"] or "", name=slot["name"] or "",
+                                  arguments="".join(slot["args"])))
 
         # ── 结论交出去 ──
         if outcome is not None:

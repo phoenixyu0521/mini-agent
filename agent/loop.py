@@ -412,60 +412,40 @@ class AgentLoop:
             self.last_usage = outcome.usage
 
             # ═══════════════════════════════════════════════════════
-            # TODO ③ —— 这里是「切换点」：模型要调工具时，转到非流式干活
+            # 切换点：模型要调工具时，从这里转到非流式干活
             #
-            #   要写三步（都写在下面这个 if 里面）：
+            #   三步，缺一不可：
             #
-            #     1) 把这一轮已经收到的东西包装成一条 Reply：
-            #
-            #            reply = llm.Reply(
-            #                text="".join(pieces),        # 已经流出来的正文
-            #                usage=outcome.usage,
-            #                tool_calls=outcome.tool_calls,
-            #            )
-            #
+            #     1) 把这轮已收到的东西包装成一条 Reply —— 关键是 text 也要带上。
             #        ⚠️ 为什么不能只把 tool_calls 传下去、把 text 丢掉？
             #           实测过 tool_calls 和 content 可以同时存在 ——
             #           模型可能说的是「我来帮你查一下」，然后才调工具。
             #           丢掉它，模型下一轮会以为自己没说过那句话。
             #
-            #     2) 跑工具循环，**把它产出的事件原样转发出去**：
+            #     2) 跑工具循环，把产出的事件**原样转发**出去（前端靠它画卡片）。
+            #        必须 for + yield，不能只调用 —— 它是生成器，
+            #        **不迭代就一行都不会执行，而且不会报错**。
             #
-            #            sink: dict[str, Any] = {}
-            #            for event in self._run_tool_rounds(reply, schemas, 5, sink):
-            #                yield event
-            #
-            #        为什么要转发？因为前端要靠这些事件画工具卡片。
-            #        为什么是 for + yield，不能直接调用？因为它是**生成器**：
-            #        不迭代就一行都不会执行，而且**不会报错**。
-            #
-            #     3) 把最终正文也作为 text 事件交出去：
-            #
-            #            yield {"type": "text", "text": sink["text"]}
-            #
-            #        用户真正想看的答案在这一段里，前面那段只是「我去查一下」。
+            #     3) 最终正文也作为 text 事件交出去。
+            #        用户真正想看的答案在这一段，前面那段只是「我去查一下」。
             #
             #   ⚠️⚠️ 这个 if 里**绝对不要**再 append reply.to_message()。
             #       保存那条带 tool_calls 的消息是 _run_tool_rounds 的活（它内部会做）。
             #       在这里再存一次，模型会看到两条一模一样的调用声明 ——
             #       轻则重复浪费 token，重则服务商直接报「tool_calls 消息格式错误」。
             #       （写参考实现时正是踩了这一脚：落盘多出一条空 assistant）
-            #
-            #   ⚠️ 也**不要**在这里补一条 {"role":"assistant", ...}：
-            #       else 分支已经负责那件事，而它只会在「没工具」时执行。
             # ═══════════════════════════════════════════════════════
             if outcome.tool_calls:
-                # 「还没写完」要用**明确的方式**说出来，不能静默当成普通对话 ——
-                # 静默的后果是模型点了工具、工具没执行、用户看到一段没头没尾的
-                # 回答，而且日志上一切正常。这个坑 10-19 刚在 stream_chat 里踩过。
-                raise NotImplementedError(
-                    "流式路径的工具切换点还没写（agent/loop.py 的 TODO ③）。"
-                    "可以先用 /api/chat 的非流式路径。"
-                )
+                reply = llm.Reply(text="".join(pieces), usage=outcome.usage,
+                                  tool_calls=outcome.tool_calls)
+                sink: dict[str, Any] = {}
+                for event in self._run_tool_rounds(reply, schemas, 5, sink):
+                    yield event
+                yield {"type": "text", "text": sink["text"]}
+
             else:
                 # ── 模型没要工具 —— 和 v0.8 完全一样 ──
-                # 这段不是你该写的 TODO：它就是第 3 周「碎片收集 + 拼完整再存」
-                # 那段代码挪了个位置。留空会直接让纯聊天不再落盘。
+                # 这就是第 3 周「碎片收集 + 拼完整再存」那段代码挪了个位置。
                 #
                 # 必须拼成**一整条**消息再存：下一轮会把 messages 里每一项重新发一遍，
                 # 每一项都必须是一条完整消息 —— 存 100 个碎片进去，格式就坏了。
