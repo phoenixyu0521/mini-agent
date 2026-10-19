@@ -585,6 +585,99 @@ class AgentLoop:
             self.meter.count_request(reply.usage)
         return reply
 
+    def _execute_tool_calls(self, tool_calls: list[llm.ToolCall]) -> list[str]:
+        """执行一批工具调用，返回**与入参同序**的结果字符串列表。
+
+        ⚠️ 为什么返回值必须同序，不能按「谁先跑完」收集？
+            模型是按下标顺序想事的：「先建目录，再写文件」。
+            它的下一条回复要靠 tool 消息的顺序来对应自己的意图。
+            顺序一乱，模型看到的结果就像被洗过牌 —— 它可能把 A 的结果
+            当成 B 的，然后基于错误前提继续推理。**不会报错，只会答得很怪。**
+
+        ⭐⭐ 这一节的核心问题：并行。
+
+        但先看清一个前提，否则会白改一通：
+
+            现在所有工具都是 `def run()` —— **同步阻塞**函数
+            （subprocess.run、open、time 计算）。
+
+            对同步函数，`async def` + `asyncio.gather` **不会**让它并行：
+            函数体里没有 await 点，gather 只是把它们一个接一个地调用完。
+            更糟的是，把阻塞函数塞进事件循环会把它整个卡住 ——
+            并发的目的是「别互相等」，结果变成了「全都等这一个」。
+
+            所以这里用**线程池**：每个工具在自己的线程里阻塞，互不等待。
+            （想真正用 async，得把工具改成 `await asyncio.create_subprocess_shell`
+             这类真异步 I/O —— 那是另一件事，收益和代价都要重新算。）
+
+        ⭐ 第三个问题：不是所有工具都能并发。
+            `Tool.concurrency_safe` 默认是 False，只有显式声明过的才进池子。
+            判断标准是「有没有副作用、依不依赖顺序」：
+                read_file 读两个不同文件 → 随便并发
+                run_shell  可能写文件、可能「先 A 后 B」 → 必须串行
+        """
+        if not tool_calls:
+            return []
+
+        # 只有「全部都是只读工具」才并行。
+        #
+        # 为什么是「全部」而不是「把安全的挑出来并行、不安全的排后面」？
+        #   因为后者会**改变模型的意图顺序**。模型说「先跑命令，再读结果文件」，
+        #   你把 read_file 提到前面并行，读到的就是旧内容。
+        #   宁可整批退化成串行 —— 慢是可见的，顺序错是不可见的。
+        all_safe = all(
+            getattr(self.tools.get(tc.name), "concurrency_safe", False)
+            for tc in tool_calls
+        )
+
+        # 工具执行单独计时：它是**本地**耗时，和模型等待（秒级）差几个数量级。
+        # 混在一起平均就看不出问题了。整批套一层，量到的就是这批的真实墙钟时间。
+        with self.meter.phase("tool") if self.meter else nullcontext():
+            if len(tool_calls) == 1 or not all_safe:
+                # 串行：只有一个工具，或有副作用，没有并行的空间/资格
+                return [
+                    self.tools.call(tc.name, tc.parsed_arguments())
+                    for tc in tool_calls
+                ]
+
+            # ═══════════════════════════════════════════════════════
+            # TODO ① —— 让这批只读工具**真的**并行
+            #
+            #   现在的下一行代码是串行兜底（功能正确，只是不快）。
+            #   把那行换成线程池版本。
+            #
+            #   要 import：
+            #       from concurrent.futures import ThreadPoolExecutor
+            #
+            #   三个动手前该答出来的问题：
+            #
+            #   Q1. max_workers 填多少？写死 8 行不行？
+            #       提示：模型一轮最多点几个工具？（看 max_iterations 的注释）
+            #             线程开多了的代价不是「慢」，是**每个线程都占内存**，
+            #             而且你根本不会有 8 个任务可跑。
+            #             有没有一个「刚好够用」的写法？
+            #
+            #   Q2. 怎么做到「并行跑、按原顺序拿回」？
+            #       提示：`pool.map(fn, 参数序列)` 返回的结果**天然保序**，
+            #             而且它自己会分发任务，不需要你排队。
+            #             但注意：map 的第一个参数只能吃**一个**位置参数。
+            #             你现在要传的是 (name, args) 两项 —— 怎么办？
+            #             （有个东西能把「调用」变成「待调用」，名字叫 partial）
+            #
+            #   Q3. 某个工具抛异常，会不会拖垮同批其他工具？
+            #       提示：`self.tools.call()` 已经把一切异常吞成 "[错误] ..." 字符串了，
+            #             所以这里天然安全。
+            #             但想清楚：这个安全性来自 call()，**不是来自线程池**。
+            #             哪天有人绕过 call() 直接 pool.submit(tool.run)，
+            #             一个异常就只在 future 里躺着，你 `.result()` 时才炸。
+            #
+            #   写完这行之后，串行兜底要删掉 —— 别留两条路，会有人走错那条。
+            # ═══════════════════════════════════════════════════════
+            return [
+                self.tools.call(tc.name, tc.parsed_arguments())
+                for tc in tool_calls
+            ]
+
     def _run_tool_rounds(
         self,
         reply: llm.Reply,
@@ -626,12 +719,10 @@ class AgentLoop:
             # ─────────────────────────────────────────────────────
             self.messages.append(reply.to_message())
 
-            for tc in reply.tool_calls:
-                args = tc.parsed_arguments()
-                # 工具执行单独计时：它是**本地**耗时（毫秒级），
-                # 和模型等待（秒级）差三个数量级。混在一起平均就看不出问题了。
-                with self.meter.phase("tool") if self.meter else nullcontext():
-                    result = self.tools.call(tc.name, args)
+            # 执行（可能并行）。返回的结果**与入参同序**，所以下面能直接 zip。
+            results = self._execute_tool_calls(reply.tool_calls)
+
+            for tc, result in zip(reply.tool_calls, results):
                 if self.meter is not None:
                     self.meter.m.tool_calls += 1
                 self.last_tool_calls += 1

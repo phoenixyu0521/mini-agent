@@ -74,6 +74,15 @@ ALLOWED_COMMANDS = {"echo", "date", "time", "dir", "ls", "pwd"}
 class RunShellTool(Tool):
     name = "run_shell"
 
+    # ⚠️ 不声明 concurrency_safe —— 用基类的默认值 False。
+    #
+    # 为什么？这份实现目前只允许 echo/date/dir/ls/pwd 这类只读命令，
+    # 理论上并发也安全。但「安全」的判据不能只看**当前**的白名单：
+    #   ① 白名单以后可能放宽（用户一句「能不能跑 git status」就扩大了）
+    #   ② 命令带顺序语义时（先 cd 再 ls）并发会破坏模型的本意
+    #   ③ 一个工具的安全性不该取决于它此刻的实现细节
+    # 所以宁可让 shell 串行 —— 慢一点，但不会被将来的改动埋雷。
+
     description = (
         "在工作目录内执行一条**只读**的 shell 命令并返回输出。"
         "只支持少量安全命令（echo / date / dir / ls / pwd）。"

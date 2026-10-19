@@ -53,6 +53,21 @@ class Tool(ABC):
 
     parameters: dict[str, Any] = EMPTY_PARAMS
 
+    # ── 第 4 周：这个工具能不能和同批的其他工具**同时**执行？ ──
+    #
+    # 默认 **False**，必须显式声明才能并发。这是 fail-closed：
+    # 猜错的代价是不对称的 ——
+    #   猜「安全」但实际不安全 → 两个 run_shell 同时改同一个文件，结果是随机的
+    #   猜「不安全」但实际安全 → 只是慢一点
+    #
+    # 判断标准只有一条：**会不会产生副作用 / 依赖执行顺序**。
+    #   get_time、read_file → 只读，随便并发
+    #   run_shell           → 可能写文件、可能按顺序才有意义 → 不能并发
+    #
+    # 注意：这不只是「快不快」的问题。真实系统里（比如 Cline）也会把
+    # 有副作用的工具单独串起来跑，否则模型以为的「先建目录再写文件」会失效。
+    concurrency_safe: bool = False
+
     def schema(self) -> dict[str, Any]:
         """打包成模型能看懂的「说明书」。
 

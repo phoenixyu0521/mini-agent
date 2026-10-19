@@ -79,6 +79,10 @@ DENIED_SUFFIXES = {
 class ReadFileTool(Tool):
     name = "read_file"
 
+    # 只读：同一批里读两个不同文件，同时跑完全没问题。
+    # 并发读同一个文件也没事 —— 读不会改内容。
+    concurrency_safe = True
+
     description = (
         "读取项目目录内的文本文件并返回内容。"
         "当用户让你看某个文件、读某段配置、总结某个文档时调用。"

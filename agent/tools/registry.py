@@ -53,6 +53,21 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return sorted(self._tools)
 
+    def get(self, name: str) -> Tool | None:
+        """按名字取工具本体，没有就返回 None。
+
+        第 4 周加它是因为「并发」需要**问工具一个问题**：
+        「你能和同批其他工具同时跑吗？」（`Tool.concurrency_safe`）
+
+        这件事 `call()` 做不到 —— call 只给结果字符串，不给工具本身；
+        也不该为了这个问题就真去执行一次工具。
+
+        为什么不返回 `_tools[name]` 让它 KeyError？
+            因为调用方要处理的正是「模型点了个不存在的工具名」这种情况，
+            那是**正常输入**不是异常。返回 None 让调用方自己决定怎么兜。
+        """
+        return self._tools.get(name)
+
     def schema_list(self) -> list[dict[str, Any]]:
         """所有工具的说明书，直接塞进请求的 tools 字段。
 

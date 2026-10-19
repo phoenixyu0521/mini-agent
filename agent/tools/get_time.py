@@ -28,6 +28,11 @@ from agent.tools.base import Tool
 class GetTimeTool(Tool):
     name = "get_time"
 
+    # 只读：不碰任何共享状态，和同批其他工具同时跑没有任何风险。
+    # 本机是毫秒级，并发收益看不出来 —— 但声明对了，将来换实现（比如调时区 API）
+    # 才不会莫名其妙变慢。
+    concurrency_safe = True
+
     description = (
         "获取当前的日期和时间。"
         "当用户询问现在几点、今天几号、明天是什么日子时，必须调用这个工具，"
