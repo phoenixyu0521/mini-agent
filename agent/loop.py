@@ -92,46 +92,17 @@ class AgentLoop:
         # 所以这里默认是「不记」—— 记不记是一种策略，不该硬编码在核心里。
         self.meter: metrics.Meter | None = None
 
-        # ─────────────────────────────────────────────────────────
-        # TODO v0.10 —— 这一轮对外来说是一次请求，对内核来说是 N 次模型往返。
+        # ── 第 4 周 v0.10：本轮调了几次工具 ──────────────────
+        # 它必须由**内核**给，入口层自己算不出来：
+        #   server.py 拿到的是一个**字符串**（回复正文），
+        #   字符串里没有「调了几次工具」这个信息。
+        # 如果让入口层去数 agent.messages 里 role=="tool" 的条数，
+        # 数到的是**这个会话累计**的，不是这一轮的 —— 会越聊越离谱。
         #
-        # 背景（先看清问题再动手）：
-        #   run_with_tools("现在几点") 这一次调用，内部会发**两次** HTTP 请求：
-        #       第 1 次  模型说「我要调 get_time」
-        #       第 2 次  模型看到结果，说人话
-        #   实测：普通一轮 1 次请求，工具轮 2 次请求（更多工具就更多次）。
-        #
-        #   但对 HTTP 入口来说，这只是**一个** POST /api/chat。
-        #   于是就有了这个新问题：
-        #       浏览器只发了 1 次请求，怎么知道里面发生了 2 次？
-        #
-        #   为什么这个数字必须由内核给，入口层自己算不出来？
-        #       server.py 拿到的是一个**字符串**（回复正文）。
-        #       字符串里没有「调了几次工具」这个信息。
-        #       如果让入口层去数 agent.messages 里 role=="tool" 的条数，
-        #       数到的是**这个会话累计**的，不是这一轮的 —— 会越聊越离谱。
-        #
-        #   要写的是：一个实例属性，初值 0，
-        #   在 run_with_tools() 这一轮里随每次工具执行而累加，
-        #   每一轮开始时归零。
-        #
-#   动手前先回答两个问题：
-        #
-        #   Q1：归零放在哪一步？
-        #       a) _tools_loop() 开头    b) 每次 for tc 循环里
-        #       c) run_with_tools() 开头
-        #       提示：run_with_tools() 是「对外的一次」，工具循环可能一次都不调工具
-        #             （模型直接回答了）。归零位置决定了「这轮没调工具」时这个值是多少。
-        #
-        #   Q2：为什么不能用 self.meter.m.tool_calls 顶替？
-        #       提示：meter 在 _close_meter() 之后会被置成 None，
-        #             而 _close_meter() 恰恰是在 run_with_tools() 返回**之前**调的。
-        #             入口层拿到返回值时，meter 已经没了。
-        #             —— 这是一个「临时对象活不过调用方」的例子，很常见。
-        #
-        #   （下面这行已给好，直接把 TODO 替掉即可；累加的位置在 _tools_loop 里）
-        #   self.last_tool_calls = 0
-        # ─────────────────────────────────────────────────────────
+        # 归零位置是「一轮对话开始时，只归零一次」（在 stream() 和
+        # _tools_loop() 的入口处），不是每次工具调用前 ——
+        # 次数要累加，不是要记住最后一次。
+        self.last_tool_calls = 0
 
     # ── 第 4 周：可观测性接线（脚手架，已写好）──────────────
 
@@ -353,7 +324,7 @@ class AgentLoop:
             self._close_meter()
         return reply.text
 
-    def stream(self, user_text: str) -> Iterator[str]:
+    def stream(self, user_text: str, use_tools: bool = False) -> Iterator[dict[str, Any]]:
         """和 run() 做同一件事，区别是「一小段一小段地交出来」而不是一次给完。
 
         ⭐ 为什么第 4 周才把它从 run_stream() 里拆出来？（这是本周的第一个设计课）
@@ -374,8 +345,35 @@ class AgentLoop:
             run() 有这个调用，run_stream() 漏了。
             现在补上（在本方法末尾），CLI 和 Web 两条路都能正确存盘。
 
-        这个方法本身没有留 TODO —— 因为「碎片收集 + 拼完整再存」正是你第 3 周
-        亲手补过的东西（当时叫 TODO ②），这里只是把它挪个位置。
+        ⭐⭐ v0.10 第 2 步：yield 的东西从「裸字符串」变成了「事件 dict」
+
+            为什么必须变？
+                现在一轮里可能出现三种东西：一段文字、一次工具调用、一次工具结果。
+                如果还只 yield 字符串，调用方根本分不清
+                「这段字是模型说的话」还是「这段字是工具的输出」——
+                而这两者在界面上要长得完全不一样。
+
+            **事件是传输格式，不是领域对象**，所以这里用 dict 而不是 dataclass：
+                入口层拿到就能 json.dumps 成 SSE 帧，零转换；
+                用 dataclass 则每个消费者都要多写一次 asdict()。
+
+            事件格式（就三种，前端按 type 分派）：
+                {"type": "text", "text": "你"}
+                {"type": "tool", "name": "get_time", "arguments": "{...}",
+                 "result": "[错误] ...", "ok": false}
+                （"done" 事件不由内核发 —— 那是传输层的结束标记，见 server.py）
+
+        ⭐⭐⭐ 这个方法承载了第 2 步的全部难点：切换
+
+            流式负责「说话」，非流式负责「干活」。
+            具体流程：
+                1. 用流式发第一轮请求（带上工具说明书）
+                2. 如果这一轮没有 tool_calls → 就是一次普通对话，说话结束
+                3. 如果**有** tool_calls → 在当前位置切换：
+                   把已收到的正文存成 assistant 消息（必须带上 tool_calls 字段），
+                   然后转非流式，把工具循环跑完，最终正文再作为 text 事件下发
+
+            前端感知到的仍然是一条连续的流，只是中间多了一张工具卡片。
 
         ⚠️ 第 4 周加的计时器**只包住模型等待那一段**，
             故意不包 `self._view()`：
@@ -383,9 +381,15 @@ class AgentLoop:
             你会以为打字机本身变慢了，其实是压缩在花时间。
         """
         self.messages.append({"role": "user", "content": user_text})
+        self.last_tool_calls = 0   # 一轮开始，计数归零（只归零这一次）
 
         # 视图单独算（可能触发压缩）。**不计时** —— 见下面的注释。
         view = self._view()
+
+        # 说明书只取一次 —— 它在这一轮里不会变。
+        schemas = None
+        if use_tools and self.tools is not None:
+            schemas = self.tools.schema_list()
 
         # stream() 自己造计时器（而不是让调用方造）——
         # 因为它是**生成器**：函数体在第一次 next() 时才执行，
@@ -393,6 +397,7 @@ class AgentLoop:
         # 生成器里 self-close 更难保证，所以选择「造+收都在里面」。
         self.meter = self._new_meter("stream")
         pieces: list[str] = []
+        outcome = llm.StreamOutcome()   # 流结束后，结论会装在这里
         try:
             # 流式的计时段只包住「收到片段」这段时间。
             # ⚠️ 这里**故意不包 self._view()**：
@@ -400,17 +405,61 @@ class AgentLoop:
             #     你会以为打字机本身变慢了，其实是压缩在花那几秒。
             #     两件事必须分开归因，否则指标会骗人。
             with self.meter.phase("model"):
-                for piece in llm.stream_chat(view):
+                for piece in llm.stream_chat(view, tools=schemas, outcome=outcome):
                     pieces.append(piece)
-                    yield piece
-            # 流式接口不返回 usage（SSE 里没有 usage 帧），
-            # 所以只记「请求了几次」，token 账对流式来说是未知的 ——
-            # 这是一个**诚实的缺口**，比编一个假数字强。
-            self.meter.count_request(None)
+                    yield {"type": "text", "text": piece}
+            self.meter.count_request(outcome.usage)
+            self.last_usage = outcome.usage
 
+            # ═══════════════════════════════════════════════════════
+            # TODO ③ —— 这里是「切换点」：决定这一轮流式结束后往哪走
+            #
+            #   ── 情况 A：模型要调工具（这是 TODO，你来写）──
+            #      a) 先把它这一轮的 assistant 消息存进 self.messages。
+            #         ⚠️ 必须用 llm.Reply(...) 包一层再调 .to_message()，
+            #            不能手写成 {"role":"assistant","content":...} ——
+            #            因为这条消息**必须带上 tool_calls 字段**，
+            #            否则下一轮服务商会说「你的 tool 消息没有对应的调用」。
+            #         Reply 的三个参数：
+            #             text=已收到的正文, usage=outcome.usage,
+            #             tool_calls=outcome.tool_calls
+            #
+            #      b) 调 self._run_tool_rounds(...)，它会把工具跑完、
+            #         把后续模型往返走完，**最终正文写进 sink["text"]**。
+            #         注意它是生成器，要 for 循环消费 —— 而且要**逐个 yield 出去**：
+            #
+            #             sink: dict[str, Any] = {}
+            #             for event in self._run_tool_rounds(reply, schemas, 5, sink):
+            #                 yield event
+            #             yield {"type": "text", "text": sink["text"]}
+            #
+            #         为什么要 yield event？因为前端要靠它画工具卡片。
+            #         为什么要 yield 最终正文？因为用户真正想看的答案在这里，
+            #         前面那段只是模型在说「我来帮你查一下」。
+            #
+            #   动手前先答：为什么 A 里那条 assistant 消息的 content
+            #   要用「已收到的正文」而不是空字符串？
+            #       提示：实测过 tool_calls 和 content 可以同时存在，
+            #             模型可能说的是「我来帮你查一下」。
+            #             丢掉它，模型下一轮会以为自己没说过那句话。
+            # ═══════════════════════════════════════════════════════
+            if outcome.tool_calls:
+                # 「还没写完」要用**明确的方式**说出来，不能静默当成普通对话 ——
+                # 静默的后果是模型点了工具、工具没执行、用户看到一段没头没尾的回答，
+                # 而且日志上一切正常。这个坑 10-19 刚在 stream_chat 里踩过一次。
+                raise NotImplementedError(
+                    "流式路径的工具切换点还没写（agent/loop.py 的 TODO ③）。"
+                    "可以先用 /api/chat 的非流式路径。"
+                )
+
+            # ── 情况 B：模型没要工具 —— 和 v0.8 完全一样 ──
+            # 这段不是你该写的 TODO：它就是第 3 周「碎片收集 + 拼完整再存」
+            # 那段代码挪了个位置。留空会直接让纯聊天不再落盘。
+            #
             # 必须拼成**一整条**消息再存：下一轮会把 messages 里每一项重新发一遍，
             # 每一项都必须是一条完整消息 —— 存 100 个碎片进去，格式就坏了。
             self.messages.append({"role": "assistant", "content": "".join(pieces)})
+
             self.flush_session()   # ← 第 3 周漏掉的那一行
         except Exception as exc:  # noqa: BLE001
             self._close_meter(f"{type(exc).__name__}: {exc}")
@@ -418,16 +467,25 @@ class AgentLoop:
         else:
             self._close_meter()
 
-    def run_stream(self, user_text: str) -> str:
-        """终端用：消费 stream()，把每一段立刻打出来。
+    def run_stream(self, user_text: str, use_tools: bool = False) -> str:
+        """终端用：消费 stream()，把事件显示成人能看的样子。
 
-        注意它自己**不含任何逻辑** —— 只是把 stream() 产出的东西显示出来。
+        注意它自己**不含任何逻辑** —— 只是把 stream() 产出的事件显示出来。
         这正是拆分的好处：Web 版只要写另一个消费者（打包成 SSE），内核一行不改。
+
+        v0.10 第 2 步之后，它要处理的不只是文字了：
+        工具调用在终端里用一行 `[调工具] get_time` 提示即可 ——
+        **同一个事件，不同入口有不同的展示方式**，这就是分开的理由。
         """
         pieces: list[str] = []
-        for piece in self.stream(user_text):
-            pieces.append(piece)
-            print(piece, end="", flush=True)
+        for event in self.stream(user_text, use_tools=use_tools):
+            if event["type"] == "text":
+                pieces.append(event["text"])
+                print(event["text"], end="", flush=True)
+            elif event["type"] == "tool":
+                # 终端不适合画卡片，一行摘要足够
+                flag = "" if event.get("ok", True) else " ✗"
+                print(f"\n  · 调工具 {event['name']}{flag}", flush=True)
         print()
         return "".join(pieces)
 
@@ -483,12 +541,24 @@ class AgentLoop:
             self._close_meter()
 
     def _tools_loop(self, user_text: str, max_iterations: int) -> str:
-        """工具循环的本体。计时在调用方 run_with_tools() 里管，这里只管逻辑。
+        """工具循环的入口（非流式路径）。计时在 run_with_tools() 里管，这里只管逻辑。
 
-        为什么把循环单独抽成一个方法？
-            因为 run_with_tools() 现在要做三件事：开工、收尾（含 try/finally）、
-            跑逻辑。三件事混在一个方法里，try 块会包住一大段，
-            你会看不出「哪一段真的需要 try 保护」。
+        ⭐ v0.10 第 2 步把它拆成了三块：
+            _tools_loop         —— 追加用户消息、打第一次请求，然后交给下面
+            _request_with_tools —— 「打一次带工具的请求 + 计时 + 记 token 账」
+            _run_tool_rounds    —— 工具循环本体，**流式和非流式共用同一份**
+
+        为什么非要共用？
+            因为流式那条路在检测到 tool_calls 之后，要跑的是**一模一样**的循环。
+            各写一份的话，两边迟早走偏 ——
+            「改了一边忘了另一边」是真实项目里最常见的 bug 来源之一。
+
+        ⭐ 顺带修掉一个计数 bug：
+            原来的 `self.last_tool_calls = 0` 写在「模型要调工具」那个分支**里面**，
+            也就是 for 循环每转一圈都归零一次。
+            一次对话调两轮工具（第 1 轮 2 个、第 2 轮 1 个），结果只会报 1 而不是 3。
+            正确的位置是「一轮对话开始时归零**一次**」——
+            归零是「清空本轮」，不是「清空这次工具调用」。
         """
         # 第 1 件事和第 1 周完全一样：把用户这句话追加进去。
         self.messages.append({"role": "user", "content": user_text})
@@ -496,82 +566,71 @@ class AgentLoop:
         # 说明书只取一次 —— 它在这一轮里不会变。
         schemas = self.tools.schema_list()
 
-        for round_no in range(1, max_iterations + 1):
-            # 每一轮都把**整个** messages 重新发一遍。
-            # 和第 1 周是同一件事，只是列表里现在会多出 tool_calls 和 tool 两种消息。
-            # ⚠️ 注意这里每轮都重算 _view() —— 因为工具结果刚追加进去，
-            #    列表变长了，视图也该跟着变。（压缩判断是幂等的，代价很小）
-            with self.meter.phase("model") if self.meter else nullcontext():
-                reply = llm.chat(self._view(), tools=schemas)
-            if self.meter is not None:
-                self.meter.count_request(reply.usage)
+        # 一轮开始，计数归零。**只归零这一次**，后面的累加都发生在 _run_tool_rounds 里。
+        self.last_tool_calls = 0
 
-            # ─────────────────────────────────────────────────────────
-            # TODO ① —— 它没要求调工具，说明这轮聊完了
-            #
-            #   写三行：
-            #     1) 把它的回复存进 self.messages
-            #        用 reply.to_message()。这个方法会顺手处理好 tool_calls 字段，
-            #        也顺手帮你挡住了服务商不认识的私有字段。
-            #     2) self.last_usage = reply.usage     （记账，不然 CLI 打不出 token）
-            #     3) return reply.text                 （把正文交出去）
-            #
-            #   第 1 步为什么不能省？第 1 周你已经答过这个问题了：
-            #   不存，下一轮发出去的历史里就没有它自己说过的话。
-            # ─────────────────────────────────────────────────────────
+        reply = self._request_with_tools(schemas)
+
+        # ⚠️ _run_tool_rounds 是**生成器**：不迭代就一行都不会执行，而且不报错。
+        #    非流式这条路不需要事件，所以空跑一遍把它跑完 ——
+        #    结果通过 sink 带出来（为什么不用 return 值，见 _run_tool_rounds 的注释）。
+        sink: dict[str, Any] = {}
+        for _event in self._run_tool_rounds(reply, schemas, max_iterations, sink):
+            pass
+        return sink.get("text", "")
+
+    def _request_with_tools(self, schemas: list[dict[str, Any]]) -> llm.Reply:
+        """打一次「带工具说明书」的请求，顺带计时 + 记 token 账。
+
+        抽出来的理由很实际：一次工具轮里这个动作会重复 N 次，
+        而计时/记账的写法每次都必须一模一样 ——
+        复制粘贴五遍，迟早漏掉一处 `count_request`，然后指标就开始骗人。
+        """
+        with self.meter.phase("model") if self.meter else nullcontext():
+            reply = llm.chat(self._view(), tools=schemas)
+        if self.meter is not None:
+            self.meter.count_request(reply.usage)
+        return reply
+
+    def _run_tool_rounds(
+        self,
+        reply: llm.Reply,
+        schemas: list[dict[str, Any]],
+        max_iterations: int,
+        sink: dict[str, Any],
+    ) -> Iterator[dict[str, Any]]:
+        """工具循环本体。**流式和非流式共用**。
+
+        为什么是生成器？因为流式那条路需要在工具执行完的**那一刻**
+        立刻把「调了哪个工具、结果是什么」推给前端 ——
+        不能等整轮跑完再一起给，那样用户会盯着空白屏幕好几秒。
+
+        为什么结果走 sink 而不是 return？
+            生成器的 return 值被 StopIteration 包着，两个调用方都得写 try/except
+            才拿得到。用一个「调用方自己造的字典」简单得多 ——
+            和 llm.StreamOutcome 是同一个套路。
+
+        参数 reply 是**已经拿到手的那条**模型回复：
+            流式路径  —— 传「流式收完拼出来的那条」（可能已经带了 tool_calls）
+            非流式路径 —— 传「chat() 返回的那条」
+        """
+        for round_no in range(1, max_iterations + 1):
+            # ─────────────────────────────────────────────────────
+            # 它没要求调工具，说明这轮聊完了
+            # ─────────────────────────────────────────────────────
             if not reply.wants_tools:
                 self.messages.append(reply.to_message())
                 self.last_usage = reply.usage
                 self.flush_session()   # 第 3 周：工具调用的中间消息也要存
-                return reply.text
+                sink["text"] = reply.text
+                return
 
-            # ------------------------------------------------------------------
-            # TODO v0.10-① —— 在这一轮开始时把 self.last_tool_calls 归零
+            # ─────────────────────────────────────────────────────
+            # 它要求调工具，你替它办事
             #
-            #   一行：`self.last_tool_calls = 0`
-            #
-            #   为什么必须放在**这里**而不是 run_with_tools() 开头？
-            #       因为 run_with_tools() 开头到第一次 llm.chat() 之间，
-            #       中间还有 _view()、可能触发压缩（压缩自己也要调一次模型）。
-            #       这些步骤本身不该影响「这一轮调了几次工具」。
-            #
-            #   为什么「这里」也不晚？
-            #       因为 for 循环可能跑好几轮 round_no，每一轮都是一次模型往返，
-            #       但只有走到这个分支才说明「模型真的要调工具」。
-            #       放在 while 之外就会把「直接回答」的那轮也重置一次 ——
-            #       那种情况下这个值本来就该是 0，行为一致。
-            # ─────────────────────────────────────────────────────────
-
-            # ─────────────────────────────────────────────────────────
-            # TODO ② —— 它要求调工具，你替它办事
-            #
-            #   步骤比 ① 多，但顺序只有一条，别乱：
-            #
-            #     1) 先把这条 assistant 消息存进 self.messages
-            #        还是 reply.to_message()
-            #
-            #        ⚠️ 顺序是硬要求：它必须排在下面那条 role="tool" 的**前面**。
-            #           协议规定「先声明要调，再给结果」，反了服务商直接报错。
-            #
-            #     2) 逐个处理 reply.tool_calls（用 for 循环），每个做三件事：
-            #
-            #          a. 取参数：args = tc.parsed_arguments()
-            #             记住 arguments 原样是**字符串**，别直接当 dict 用。
-            #             （这个方法内部已经兜住了坏 JSON —— 为什么这么设计，
-            #               去看 llm.py 里 ToolCall.parsed_arguments 的注释）
-            #
-            #          b. 执行：result = self.tools.call(tc.name, args)
-            #             返回的一定是字符串，出错也会返回 "[错误] ..." 而不是抛异常。
-            #
-            #          c. 追加一条消息：
-            #             {"role": "tool", "tool_call_id": tc.id, "content": result}
-            #             这是第 1 周没见过的第四种 role。它的作用只有一个：
-            #             告诉模型「这是你刚才点名的那个函数的结果」，靠 tool_call_id 对号。
-            #
-            #     3) 这一步**不要 return，也不要打印**。
-            #        什么都不做，让 for 循环进入下一轮 —— 把已经变长的 messages
-            #        再发一次。下一轮模型看到工具结果，才会说出人话。
-            # ─────────────────────────────────────────────────────────
+            # ⚠️ 顺序是硬要求：这条 assistant 必须排在下面 role="tool" 的**前面**。
+            #    协议规定「先声明要调，再给结果」，反了服务商直接报错。
+            # ─────────────────────────────────────────────────────
             self.messages.append(reply.to_message())
 
             for tc in reply.tool_calls:
@@ -582,37 +641,35 @@ class AgentLoop:
                     result = self.tools.call(tc.name, args)
                 if self.meter is not None:
                     self.meter.m.tool_calls += 1
+                self.last_tool_calls += 1
 
-                # ─────────────────────────────────────────────────────────
-                # TODO v0.10-② —— 在这里累加本轮的工具调用次数
-                #
-                #   一行：`self.last_tool_calls += 1`
-                #
-                #   放在哪：紧跟着上面 meter 的累加，**放在工具执行之后**。
-                #
-                #   为什么不在 for 循环之前加？
-                #       那会数「模型点名了几次」，而不是「实际执行了几次」。
-                #       两者在正常情况下相等，但一旦工具名写错——
-                #       registry.call() 会返回 "[错误] 找不到工具" 字符串而不抛异常
-                #       ——你要汇报的是「尝试了几次」，还是「成功了几次」？
-                #
-                #   为什么不在函数 return 之前加？
-                #       那要维护一个局部变量，return 前再赋给 self ——
-                #       多一次赋值、多一个变量，而这里只需要一行。
-                # ─────────────────────────────────────────────────────────
-
+                # 追加第四条 role 的消息。它的作用只有一个：
+                # 告诉模型「这是你刚才点名的那个函数的结果」，靠 tool_call_id 对号。
                 self.messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": result}
                 )
 
+                # 把「刚才发生了什么」交出去。
+                # ok 的判据直接复用工具层的约定：registry.call() 出错时返回
+                # "[错误] ..." 而不是抛异常 —— 所以看前缀就够了，
+                # 不需要在这里另造一套错误码。
+                yield {
+                    "type": "tool",
+                    "name": tc.name,
+                    "arguments": tc.arguments,
+                    "result": result,
+                    "ok": not result.startswith("[错误]"),
+                }
+
+            # 这里**不要 return** —— 让循环进入下一轮，
+            # 把已经变长的 messages 再发一次。下一轮模型看到工具结果，才会说出人话。
+            reply = self._request_with_tools(schemas)
+
         # ─────────────────────────────────────────────────────────
-        # TODO ③ —— 循环跑满 max_iterations 还没结束
+        # 循环跑满 max_iterations 还没结束
         #
-        #   走到这里说明模型停不下来：要么一直在调工具，要么工具给的结果它一直不满意。
-        #   这就是 ROADMAP 里「为什么必须有 max_iterations」那个问题的答案 ——
-        #   没有刹车，它会一直调，而每次调用都是两次请求，**一直在烧钱**。
-        #
-        #   要写的是：返回一句人话，说明出了什么事。
-        #   别让它静默返回空（那样 CLI 会打印出 None，用户会以为程序坏了）。
+        # 走到这里说明模型停不下来：要么一直在调工具，要么工具给的结果它一直不满意。
+        # 这就是 ROADMAP 里「为什么必须有 max_iterations」那个问题的答案 ——
+        # 没有刹车，它会一直调，而每次调用都是两次请求，**一直在烧钱**。
         # ─────────────────────────────────────────────────────────
-        return f"已达到最大工具调用轮数（{max_iterations}），我先停在这里。"
+        sink["text"] = f"已达到最大工具调用轮数（{max_iterations}），我先停在这里。"

@@ -174,28 +174,27 @@ async def info() -> dict[str, Any]:
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest) -> dict[str, Any]:
-    """非流式的一轮。**这是唯一能带工具的端点**（v0.10）。
+    """非流式的一轮：一次性返回完整回复。
 
-    v0.10 的关键改动只有一处：调用的方法从 agent.run 换成 agent.run_with_tools。
+    v0.10 的改动：调用的方法从 agent.run 换成 agent.run_with_tools。
 
         改前  agent.run(req.message)              1 次模型往返，永远不调工具
         改后  agent.run_with_tools(req.message)   1~N 次模型往返，会调工具
 
-    为什么流式端点不能这么改？（这是本周最值得想清楚的一件事）
-        stream() 是**生成器**，它 yield 的是「一个字的片段」。
+    ⚠️ 第 2 步之后，**/api/stream 也能带工具了**。这个端点的价值变成了：
+        需要「一次性拿到完整结果 + 工具次数」的场合（脚本、自动化、测试）。
+        两个端点现在能力相同，区别只在传输方式。
+
+    为什么工具调用**不能纯流式**？（这是本周最值得想清楚的一件事）
+        stream() 是生成器，它 yield 的是一小段一小段的内容。
         而工具调用需要先拿到**完整的** tool_calls 列表才能决定下一步：
         你必须知道模型点了哪些函数、参数是什么，才能去执行。
-        边收字边决定「要不要转去执行工具」是做不到的 ——
-        前 20 个字到达时，你根本不知道这一轮会不会产生 tool_calls。
+        前 20 个小片到达时，你根本不知道这一轮会不会产生 tool_calls。
 
-        所以真实系统的做法是「流式说话 + 非流式干活」：
-        一轮里先流式收文本，一旦发现这一轮要 tool_calls，
+        所以做法是「流式说话 + 非流式干活」：
+        一轮里先流式收，一旦发现这一轮要 tool_calls，
         就在那个位置切到非流式完成工具循环，前端仍感知为一条流。
-        **本项目分两步走**，这一步先只做非流式，切换逻辑是第 2 步。
-
-    代价（这一版确实有的）：
-        带工具时，前端会「等几秒才出一整段字」，没有打字机效果。
-        这个丑是必要的 —— 它让你亲眼看到「这里必须切换」。
+        （实现见 AgentLoop.stream() 里的切换点）
     """
     agent = get_agent(req.session_id)
 
@@ -247,54 +246,42 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
 
 @app.post("/api/stream")
 async def stream(req: ChatRequest) -> StreamingResponse:
-    """SSE 流式：每收到一小段就推给浏览器，做出打字机效果。
+    """SSE 流式：边收边推给浏览器，做出打字机效果。
 
-    ⚠️ **这个端点不支持工具**（v0.10 明确边界）。要带工具请走 /api/chat。
-    原因见 /api/chat 的 docstring —— 工具调用需要先拿到完整的 tool_calls
-    才能决定下一步，而流式是一次一个字地到达。
+    ⭐ v0.10 第 2 步之后，**这个端点也支持工具了**。
+    机制是「流式说话 + 非流式干活」：内核先流式收第一轮，
+    一旦发现这一轮有 tool_calls，就在那个位置切到非流式把工具循环跑完。
+    所以前端感知到的仍然是一条连续的流。
 
-    请求里如果带了 use_tools=True，这里会**明确拒绝**，
-    而不是悄悄降级成不调工具 —— 静默降级会让人以为工具坏了。
+    帧格式（v0.10 起，多了 type 字段 —— 前端按它分派）：
+        data: {"type": "text",  "text": "你"}
+        data: {"type": "tool",  "name": "get_time", "arguments": "{}",
+                               "result": "...", "ok": true}
+        data: [DONE]      ← 结束标记（**不是内核发的**，是这一层加的）
+
+    ⚠️ 为什么 "done" 由这一层加，而不是内核 yield 一个 done 事件？
+        因为「这条流结束了」是**传输层的概念**，不是 Agent 内核的概念。
+        内核交出最后一个事件就算交完了，它不需要知道自己在被 SSE 打包。
+        这仍然是那句话：**内核提供能力，入口决定怎么显示。**
 
     为什么这个端点不用 run_in_executor？
         因为 StreamingResponse 收到**同步生成器**时，Starlette 自己会把它
         放进线程池迭代（内部叫 iterate_in_threadpool）——
         所以这里的阻塞同样不会卡住事件循环。这是框架帮我们做掉的。
 
-    帧格式是 SSE 规定的：每条消息以 `data: ` 开头，以**两个换行**结束。
-         data: {"text": "你"}
-         <空行>
-         data: {"text": "好"}
-         <空行>
-         data: [DONE]      ← 自定义的结束标记，前端收到就停止读取
-
     注意 get_agent() 是放在 generate() **里面**调的：
         这样万一它抛错，错误会变成一条 SSE 消息
         送到前端显示，而不是变成一个干巴巴的 HTTP 503 ——
         前端只需要一套错误处理逻辑。
     """
-    if req.use_tools:
-
-        async def reject() -> Iterator[str]:
-            payload = json.dumps(
-                {"error": "流式端点暂不支持工具调用（一次工具轮需要先拿到完整的 "
-                          "tool_calls 列表才能决定下一步，而流式是一个字一个字到的）。"
-                          "请改用 POST /api/chat。"},
-                ensure_ascii=False,
-            )
-            yield f"data: {payload}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(
-            reject(), media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
 
     def generate() -> Iterator[str]:
         try:
             agent = get_agent(req.session_id)
-            for piece in agent.stream(req.message):
-                payload = json.dumps({"text": piece}, ensure_ascii=False)
+            for event in agent.stream(req.message, use_tools=req.use_tools):
+                # 事件本身就是 dict，直接序列化就行 —— 这就是选 dict 的好处，
+                # 换到 dataclass 的话这里还得先 asdict() 一次。
+                payload = json.dumps(event, ensure_ascii=False)
                 yield f"data: {payload}\n\n"
             yield "data: [DONE]\n\n"
         except NotImplementedError as exc:

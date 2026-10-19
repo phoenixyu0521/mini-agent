@@ -51,6 +51,20 @@ header code{font-size:12px;background:var(--ai-bg);padding:1px 6px;border-radius
 .bubble .meta{margin-top:6px;font-size:11px;color:var(--muted);white-space:nowrap}
 .row.user .meta{color:var(--user-fg);opacity:.75}
 .waiting .bubble{color:var(--muted)}
+
+/* v0.10 第2步：工具事件卡片。
+   和 .bubble 长得刻意不一样 —— 它不是「模型说的话」，
+   是「Agent 干的事」。两者混在一起，你就分不清哪句是它说的、哪件是它做的。 */
+.tool{max-width:min(680px,78%);padding:8px 12px;border:1px dashed var(--border);
+      border-radius:10px;background:transparent;font-size:12px;line-height:1.6}
+.tool .tn{font-weight:500;color:var(--accent);margin-bottom:2px}
+.tool .ta{font-family:ui-monospace,Consolas,monospace;font-size:11px;color:var(--muted);
+          word-break:break-all}
+.tool .tr{margin-top:4px;font-family:ui-monospace,Consolas,monospace;font-size:11px;
+          color:var(--text);opacity:.8;white-space:pre-wrap;word-break:break-all;
+          max-height:96px;overflow:hidden}
+.tool.bad{border-color:#e88;background:rgba(220,60,60,.06)}
+.tool.bad .tn{color:#c33}
 #inputWrap{display:flex;gap:10px;align-items:flex-end;padding:12px 18px 16px;border-top:1px solid var(--border)}
 #input{flex:1;resize:none;font:inherit;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);max-height:160px;outline:none}
 #input:focus{border-color:var(--accent)}
@@ -71,7 +85,7 @@ header code{font-size:12px;background:var(--ai-bg);padding:1px 6px;border-radius
     <span class="dot"></span>
     <span id="model">…</span>
     <code id="sid"></code>
-    <button id="toolsBtn" title="切换：Agent 模式（带工具，不流式） /聊天模式（流式）">Agent 模式</button>
+    <button id="toolsBtn" title="切换：Agent 模式（可调工具） / 聊天模式（纯对话）">Agent 模式</button>
   </header>
   <div id="messages"></div>
   <div class="tools" id="toolBox"></div>
@@ -85,32 +99,15 @@ header code{font-size:12px;background:var(--ai-bg);padding:1px 6px;border-radius
 const $ = (id) => document.getElementById(id);
 let sessionId = null;
 let busy = false;
-// v0.10：两种模式，对应两个后端端点。
-//   agentMode = true  → POST /api/chat   （带工具，不流式，要等几秒）
-//   agentMode = false → POST /api/stream （不流式，逐字出）
-// ⚠️ 不是「哪个更好」，是「能力不同」：工具调用需要先拿到完整的 tool_calls
-//    列表才能决定下一步，而流式是一个字一个字到的。这第 4 周第 2 步会解决。
+// v0.10 第 2 步之后，两种模式走**同一个端点**（/api/stream），
+//   agentMode = true  → 带上工具说明书，模型可以调工具
+//   agentMode = false → 只聊天，不发工具
+//
+// 第 1 步时这里是「两个端点、两种能力」：
+// 带工具只能走非流式（要等几秒），聊天才逐字出。
+// 切换点做出来之后，这个取舍就不存在了 —— 值得记住的是
+// **那个丑的阶段是有必要的**：它让「这里必须切换」变得无法忽略。
 let agentMode = true;
-
-// 给一条 AI 气泡挂上元信息（token / 工具次数）
-function addMeta(bubble, info) {
-  if (!info) return;
-  const parts = [];
-  const u = info.usage || {};
-  if (u.prompt_tokens || u.completion_tokens) {
-    parts.push(`tokens ${u.prompt_tokens || 0}+${u.completion_tokens || 0}`);
-  }
-  if (info.tool_calls) parts.push(`调了 ${info.tool_calls} 次工具`);
-  if (info.elapsed_ms) parts.push(`${(info.elapsed_ms / 1000).toFixed(1)}s`);
-  if (!parts.length) return;
-  let m = bubble.querySelector(".meta");
-  if (!m) {
-    m = document.createElement("div");
-    m.className = "meta";
-    bubble.appendChild(m);
-  }
-  m.textContent = parts.join(" · ");
-}
 
 async function loadTools() {
   try {
@@ -207,47 +204,38 @@ async function newSession() {
 }
 
 // ══════════════════════════════════════════════════════════
-//  v0.10：Agent 模式 —— 非流式 + 带工具
+//  v0.10 第 2 步：工具事件卡片
 //
-//  和流式的区别只有两处：
-//    1. 端点是 /api/chat（不是 /api/stream），请求里带 use_tools: true
-//    2. 拿不到增量，只能等全部算完 —— 所以要先显示一个等待占位
+//  为什么卡片长得和气泡不一样？
+//    气泡是「模型说的话」，卡片是「Agent 干的事」。
+//    这两件事在界面上必须一眼能分开 —— 否则用户会以为
+//    「[错误] 路径越界」也是模型自己说出来的。
 //
-//  为什么不能等一个「中间进度」出来？
-//    因为工具循环整体是一次 run_in_executor 里的同步调用，
-//    中间状态在另一个线程里。v0.10 第 2 步会把这个切换点暴露成 SSE 事件。
+//  为什么不在后端决定显示成什么样？
+//    因为内核只说「调了 get_time，参数 {}，结果是 ...」，
+//    至于显示成卡片、一行文字、还是折叠面板，是**入口的事**。
+//    终端那边就只打一行 `· 调工具 get_time`，消费的是同一份事件。
 // ══════════════════════════════════════════════════════════
-async function sendAgentMode(text) {
-  const t0 = Date.now();
+
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function addToolCard(ev) {
   const row = document.createElement("div");
-  row.className = "row ai waiting";
-  const bubble = document.createElement("div");
-  bubble.className = "bubble";
-  bubble.textContent = "…";
-  row.appendChild(bubble);
+  row.className = "row ai";
+  const card = document.createElement("div");
+  card.className = "tool" + (ev.ok === false ? " bad" : "");
+  const result = String(ev.result || "");
+  card.innerHTML =
+    `<div class="tn">调工具 · ${esc(ev.name)}${ev.ok === false ? "（失败）" : ""}</div>` +
+    `<div class="ta">${esc(ev.arguments || "{}")}</div>` +
+    `<div class="tr">${esc(result.length > 300 ? result.slice(0, 300) + " …" : result)}</div>`;
+  row.appendChild(card);
   $("messages").appendChild(row);
   scrollDown();
-
-  const resp = await fetch("/api/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, message: text, use_tools: true }),
-  });
-  const data = await resp.json();
-  row.classList.remove("waiting");
-
-  if (!resp.ok) {
-    bubble.textContent = data.detail || ("HTTP " + resp.status);
-    bubble.classList.add("err");
-    return;
-  }
-  bubble.textContent = data.reply;
-  addMeta(bubble, {
-    usage: data.usage,
-    tool_calls: data.tool_calls,
-    elapsed_ms: Date.now() - t0,
-  });
-  scrollDown();
+  return card;
 }
 
 async function send() {
@@ -262,33 +250,37 @@ async function send() {
 
   addBubble("user", text);
 
-  if (agentMode) {
-    try {
-      await sendAgentMode(text);
-    } catch (e) {
-      addBubble("ai", "[连接失败：" + e.message + "]").classList.add("err");
-    }
-    busy = false;
-    $("send").disabled = false;
-    input.focus();
-    const info = await loadInfo();
-    renderSessions(info);
-    return;
-  }
-
-  const bubble = addBubble("ai", "");
+  // ⭐ v0.10 第 2 步之后，两种模式走**同一个端点**了。
+  //    第 1 步「Agent 模式不流式」是为了让你亲眼看到「这里必须切换」；
+  //    切换做完了，那个丑就没有存在理由了。
+  //    现在 agentMode 只决定一件事：要不要把工具说明书发出去。
+  let cur = addBubble("ai", "");
   const caret = document.createElement("span");
   caret.className = "caret";
-  bubble.appendChild(caret);
+  cur.appendChild(caret);
 
-  let acc = "";
+  let acc = "";        // 当前这段气泡里已经显示的字
+
+  // 工具跑完之后，最终答案要**另起一段**。
+  // 否则「我来帮你查一下」和真正的答案会挤在同一个气泡里，
+  // 读起来像一句话，但其实是模型在两轮请求里说的两段话。
+  function nextSegment() {
+    caret.remove();
+    cur = addBubble("ai", "");
+    cur.appendChild(caret);
+    acc = "";
+  }
+
   try {
     const resp = await fetch("/api/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      // ⚠️ use_tools 必须显式写 false。后端的默认值是 true，
-      //    不写会被「流式端点不支持工具」那条逻辑挡下来。
-      body: JSON.stringify({ session_id: sessionId, message: text, use_tools: false }),
+      // use_tools 直接跟随模式。流式端点从第 2 步起已经支持工具了。
+      body: JSON.stringify({
+        session_id: sessionId,
+        message: text,
+        use_tools: agentMode,
+      }),
     });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
 
@@ -312,24 +304,30 @@ async function send() {
         if (payload === "[DONE]") continue;
         let obj;
         try { obj = JSON.parse(payload); } catch { continue; }
+
         if (obj.error) {
-          bubble.textContent = acc + "\n[" + obj.error + "]";
-          bubble.classList.add("err");
+          cur.textContent = acc + "\n[" + obj.error + "]";
+          cur.classList.add("err");
+        } else if (obj.type === "tool") {
+          // 一次工具调用 = 一张卡片 + 之后另起一段
+          addToolCard(obj);
+          nextSegment();
         } else if (obj.text) {
           acc += obj.text;
-          bubble.textContent = acc;
-          bubble.appendChild(caret);
+          cur.textContent = acc;
+          cur.appendChild(caret);
         }
         scrollDown();
       }
     }
   } catch (e) {
-    bubble.classList.add("err");
-    bubble.textContent = acc + "\n[连接失败：" + e.message + "]";
+    cur.classList.add("err");
+    cur.textContent = acc + "\n[连接失败：" + e.message + "]";
   }
 
   caret.remove();
-  if (!acc && !bubble.textContent) bubble.textContent = "（没有返回内容）";
+  // 如果最后一段是空的（比如工具跑完模型没再说话），别留一个空气泡
+  if (!acc && !cur.textContent) cur.remove();
   busy = false;
   $("send").disabled = false;
   input.focus();

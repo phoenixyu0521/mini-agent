@@ -207,6 +207,33 @@ class Reply:
         return message
 
 
+@dataclass
+class StreamOutcome:
+    """流结束之后才知道的结论。由调用方传进来，生成器往里面填。
+
+    为什么需要这么一个"外部容器"？
+        生成器只有两条通道：`yield` 和 `return`。
+        `yield` 出去的东西能被 `for` 拿到，但 **`return` 的值拿不到** ——
+        `for x in gen` 结束后，那个返回值被 `StopIteration` 包着丢掉了。
+        想拿到就得手动 `next()` 再捕获异常，代码立刻难看十倍。
+
+        而「这一轮模型要不要调工具」恰恰是个**只能等流结束才知道**的结论：
+        tool_calls 分片可能出现在任何一个位置，不看完整条流就下不了判断。
+
+        所以用一个外部对象把结论"带"出来 —— 调用方自己造、自己读，
+        生成器只负责往里面填。这是生成器世界里的常规写法。
+
+    为什么 usage 也放这儿？
+        因为 SSE 的 usage 在**最后一帧**（而且那帧的 choices 是空数组）。
+        想拿到它，同样得等整条流结束。
+    """
+
+    finish_reason: str | None = None
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    usage: dict[str, Any] = field(default_factory=dict)
+    reasoning_chars: int = 0
+
+
 def load_config(profile: str | None = None) -> dict[str, Any]:
     """读配置，返回一个**扁平**的 dict。缺 Key 就抛 ConfigError。
 
@@ -316,7 +343,10 @@ def chat(
 
 
 def stream_chat(
-    messages: list[dict[str, Any]], cfg: dict[str, Any] | None = None
+    messages: list[dict[str, Any]],
+    cfg: dict[str, Any] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    outcome: StreamOutcome | None = None,
 ) -> Iterator[str]:
     """一小段一小段地拿回复。
 
@@ -330,6 +360,16 @@ def stream_chat(
     为什么这段解析也要留在这个文件里？
         因为 SSE 的格式是接口协议的一部分 —— 换服务商时它也可能要改。
         「与厂商耦合的代码只在这一个文件里」是铁律。
+
+    第 4 周新增两个参数：tools 和 outcome
+        tools    —— 传了才可能收到 tool_calls 分片（不传，服务商根本不会发）
+        outcome  —— 把「流结束才知道的结论」带出去的容器，见 StreamOutcome 的注释
+
+    ⚠️ 一个反直觉的事实（实测，2026-10-19）：
+        **tool_calls 和 content 可以同时存在。**
+        实测那条流里，模型先说了 11 个字的正文，然后才下发 tool_calls。
+        所以「content 为空」既不能当「要调工具」的判据，
+        也不能反过来当「失败」的判据 —— **唯一可靠的判据是 tool_calls 本身。**
     """
     cfg = cfg or load_config()
     # 流式用的是 client.stream()，它返回一个上下文管理器。
@@ -339,7 +379,7 @@ def stream_chat(
         "POST",
         cfg["url"],
         headers=_headers(cfg),
-        json=_payload(cfg, messages, stream=True),
+        json=_payload(cfg, messages, stream=True, tools=tools),
         timeout=cfg["timeout"],
     ) as resp:
         if resp.status_code != 200:
@@ -363,6 +403,20 @@ def stream_chat(
         finish_reason: str | None = None
         got_content = False
         reasoning_chars = 0
+        usage: dict[str, Any] = {}
+
+        # ─────────────────────────────────────────────────────────
+        # tool_calls 的分片收件箱。
+        #
+        # 结构：index -> {"id": ..., "name": ..., "args": [...]}
+        #   - 用 **dict 按 index 分桶**，不是一个 list 往后追加。
+        #     因为多个工具的分片是**交错**下发的（实测帧序：0, 0, 1, 1, 1）。
+        #     用 list 你会把 read_file 的参数拼到 get_time 后面去。
+        #   - args 用 **list 收集分片**，最后 "".join()。
+        #     不用字符串 += 是因为分片可能上千个，字符串反复拼接会产生大量中间对象。
+        #     （教学项目里这点差别看不出来，但这是正确的习惯）
+        # ─────────────────────────────────────────────────────────
+        partial: dict[int, dict[str, Any]] = {}
 
         for line in resp.iter_lines():
             if not line or not line.startswith("data:"):
@@ -380,6 +434,9 @@ def stream_chat(
             # 这里必须先判空再下标 —— 否则 IndexError 会把整轮打断。
             choices = frame.get("choices") or []
             if not choices:
+                # 空 choices 帧唯一的用途就是携带 usage，别丢掉它。
+                if frame.get("usage"):
+                    usage = frame["usage"]
                 continue
 
             choice = choices[0]
@@ -396,17 +453,93 @@ def stream_chat(
                 got_content = True
                 yield piece
 
+            # ═══════════════════════════════════════════════════════
+            # TODO ① —— 把这一帧的 tool_calls 分片收进 partial
+            #
+            #   下面是**实测的真实帧**（2026-10-19 抓的，两个工具同时调用）：
+            #
+            #     帧1  index=0  id='call_edb...'  name='get_time'   args=''
+            #     帧2  index=0  id=None           name=None         args='{}'
+            #     帧3  index=1  id='call_a6e...'  name='read_file'  args=''
+            #     帧4  index=1  id=None           name=None         args='{'
+            #     帧5  index=1  id=None           name=None         args='"path": "config.json"}'
+            #
+            #   照着数据写，别照直觉写。要点：
+            #
+            #     a) 每片都有 index，它决定这一片属于哪个工具
+            #     b) id 和 name **只在第一片出现**，后面全是 None
+            #     c) arguments 要**逐片拼接**：'{' + '"path": "config.json"}' 
+            #        = '{"path": "config.json"}' —— 拼错了 json.loads 就炸
+            #
+            #   三个动手前该答出来的问题：
+            #
+            #   Q1. 如果某个 index 第一次出现，怎么建桶？
+            #       提示：`partial.setdefault(index, {...})` 一次搞定
+            #             「有就用、没有就建」。目录里已经留好了字段名。
+            #
+            #   Q2. id / name 后面是 None，能直接覆盖前面的值吗？
+            #       提示：看帧2 —— 如果用 `= tc.get("id")` 覆盖，
+            #             帧2 会把帧1 的 id 冲成 None，最后得到 id=None 的工具。
+            #             而 tool_call_id 是回填结果时**对号入座的唯一凭据**，
+            #             丢了它，模型看到的结果就全串了。
+            #
+            #   Q3. args 用 `=` 还是 `+=`（这里是 append 到 list）？
+            #       提示：看帧3/4/5 的 args —— 是"接着写"还是"重新写"？
+            #
+            #   （骨架已给好，把下面的 pass 换成 8 行左右的实现）
+            # ═══════════════════════════════════════════════════════
+            for tc in delta.get("tool_calls") or []:
+                pass   # TODO ①
+
             # 推理模型还会吐 "reasoning_content"（思考过程），这里刻意丢掉它。
             # 被丢掉的副作用是：你会看到开头有几秒停顿，然后文字才开始蹦。
             # 想观察它在想什么，把下面两行取消注释：
             # if delta.get("reasoning_content"):
             #     yield "·"
 
-        # ── 流结束了，一个片段都没给出来 → 必须报错，不能静默返回 ──
-        # 这段检查和 chat() 里那段是同一个道理，只是触发条件不同：
-        #   chat()   —— 有 reasoning 但 content 为空
-        #   这里     —— 一个 content 帧都没收到过
-        if not got_content:
+        # ═══════════════════════════════════════════════════════════
+        # TODO ② —— 把 partial 还原成 list[ToolCall]，交给 outcome
+        #
+        #   要做的三件事：
+        #
+        #     1) 按 index **排序**后依次还原
+        #        为什么要排序？字典本身无序，而工具执行顺序会影响语义
+        #        （模型是按下标顺序想「先做 A 再做 B」的）
+        #
+        #     2) 每个工具：args 的 list 用 "".join() 拼成完整 JSON 字符串，
+        #        然后构造 ToolCall(id=..., name=..., arguments=...)
+        #        注意 arguments 是**字符串**，别在这里 json.loads ——
+        #        ToolCall.parsed_arguments() 才是负责解析的地方（且它能容错）
+        #
+        #     3) 塞进 outcome（如果调用方给了的话）
+        #        下面几行已经写好了，你只需要把 calls 造出来：
+        #
+        #            if outcome is not None:
+        #                outcome.tool_calls = calls
+        #
+        #   ⚠️ 一个边界：某个工具可能**一片内容都没有**（模型点了名但参数为空）。
+        #      这时 id/name 有、args 是空 list → 拼出来是 ""。
+        #      ToolCall 对空 arguments 是容忍的（parsed_arguments 返回 {}），
+        #      但**别 skip 掉它** —— 模型点了名就必须有对应的 tool 消息回填，
+        #      少一条服务商直接报「tool_calls 与 tool 消息不匹配」。
+        # ═══════════════════════════════════════════════════════════
+        calls: list[ToolCall] = []
+        # TODO ②
+
+        # ── 结论交出去 ──
+        if outcome is not None:
+            outcome.finish_reason = finish_reason
+            outcome.tool_calls = calls
+            outcome.usage = usage
+            outcome.reasoning_chars = reasoning_chars
+
+        # ── 流结束了却什么也没产出 → 必须报错，不能静默返回 ──
+        #
+        # ⚠️ 判据里**必须带上 calls**（这是实测抓出来的）：
+        #    模型可以「一个字不说、直接调工具」——
+        #    这时 got_content 是 False，但这不是失败，是正常的工具轮。
+        #    只看 got_content 会把正常的工具轮误判成「模型不说话」。
+        if not got_content and not calls:
             if finish_reason == "length":
                 raise RuntimeError(
                     "模型的思考把 max_tokens 吃满了，一个字正文都没输出。\n"
