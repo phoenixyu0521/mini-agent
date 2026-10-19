@@ -140,14 +140,14 @@ TEMPLATE: dict[str, Any] = {
         "fast": {
             "base_url": DEFAULT_BASE_URL,
             "model": DEFAULT_MODEL,
-            "max_tokens": 2048,
-            "timeout": 60,
+            "max_tokens": 8192,
+            "timeout": 120,
         },
         "smart": {
             "base_url": DEFAULT_BASE_URL,
             "model": "deepseek-v4-pro",
             "max_tokens": 8192,
-            "timeout": 90,
+            "timeout": 180,
         },
     },
 }

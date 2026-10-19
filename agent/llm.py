@@ -298,7 +298,12 @@ def chat(
     if not text and not tool_calls:
         raise RuntimeError(
             "模型只产出了思考、没有正文。\n"
-            "最常见原因是 max_tokens 被思考 token 吃满 —— 把 .env 里的 LLM_MAX_TOKENS 调大。\n"
+            # ⚠️ 这里必须写 config.json，不能写 .env ——
+            #    第 3 周配置化之后 max_tokens 已经搬进config.json 了。
+            #    报错文案指向一个已经没有这个配置项的文件，
+            #    会让人白翻半天 —— **报错信息指错地方比报错本身更误导**。
+            f"最常见原因是 max_tokens（当前 {cfg['max_tokens']}）被思考 token 吃满"
+            " —— 改 config.json 里对应 profile 的 max_tokens。\n"
             f"（本次思考 {len(reasoning)} 字）"
         )
 
@@ -341,6 +346,24 @@ def stream_chat(
             resp.read()
             raise RuntimeError(f"请求失败 HTTP {resp.status_code}\n{resp.text}")
 
+        # ─────────────────────────────────────────────────────────
+        # 这里要盯两个量，因为**流式下的失败模式是静默的**。
+        #
+        # 背景：推理模型会先吐 reasoning_content（思考），思考也算 max_tokens。
+        # 如果思考就把额度吃满，正文（content）会**一帧都没有**。
+        # 非流式那条路（chat()）有检查会抛错；
+        # 流式这条路如果不检查，结果就是「函数正常返回、一个片段都没有」——
+        # 调用方以为成功，界面上只是出现一个空气泡。
+        #
+        # **静默失败是最坏的失败形态**：没有 traceback、没有错误消息、
+        # 日志上一切正常，只有用户看见「它不说话」。
+        #
+        # 所以这里记两个量，在流结束时统一判断。
+        # ─────────────────────────────────────────────────────────
+        finish_reason: str | None = None
+        got_content = False
+        reasoning_chars = 0
+
         for line in resp.iter_lines():
             if not line or not line.startswith("data:"):
                 continue
@@ -348,13 +371,29 @@ def stream_chat(
             if chunk == "[DONE]":
                 break
             try:
-                delta = json.loads(chunk)["choices"][0].get("delta") or {}
-            except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+                frame = json.loads(chunk)
+            except (json.JSONDecodeError, TypeError):
                 # 坏片段跳过就行。为了一个字符崩掉整轮对话，不值得。
                 continue
 
+            # 最后一帧的 choices 可能是**空数组**（只带 usage）。
+            # 这里必须先判空再下标 —— 否则 IndexError 会把整轮打断。
+            choices = frame.get("choices") or []
+            if not choices:
+                continue
+
+            choice = choices[0]
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+            delta = choice.get("delta") or {}
+
+            # 思考内容：只在计数，不产出（见下方注释）。
+            if delta.get("reasoning_content"):
+                reasoning_chars += len(delta["reasoning_content"])
+
             piece = delta.get("content")
             if piece:
+                got_content = True
                 yield piece
 
             # 推理模型还会吐 "reasoning_content"（思考过程），这里刻意丢掉它。
@@ -362,6 +401,24 @@ def stream_chat(
             # 想观察它在想什么，把下面两行取消注释：
             # if delta.get("reasoning_content"):
             #     yield "·"
+
+        # ── 流结束了，一个片段都没给出来 → 必须报错，不能静默返回 ──
+        # 这段检查和 chat() 里那段是同一个道理，只是触发条件不同：
+        #   chat()   —— 有 reasoning 但 content 为空
+        #   这里     —— 一个 content 帧都没收到过
+        if not got_content:
+            if finish_reason == "length":
+                raise RuntimeError(
+                    "模型的思考把 max_tokens 吃满了，一个字正文都没输出。\n"
+                    f"（思考了 {reasoning_chars} 字，finish_reason=length）\n"
+                    "两个办法：把 config.json 里该profile 的 max_tokens 调大；"
+                    "或者换个不用长思考的问题。"
+                )
+            raise RuntimeError(
+                f"模型没有输出任何正文（finish_reason={finish_reason!r}）。\n"
+                f"（思考了 {reasoning_chars} 字）\n"
+                "常见原因：max_tokens 太小，或上游返回了空响应。"
+            )
 
 
 def format_usage(usage: dict[str, Any] | None) -> str:
