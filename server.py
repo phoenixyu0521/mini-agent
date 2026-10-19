@@ -39,9 +39,10 @@ from agent import metrics as metrics_mod
 from agent.loop import AgentLoop
 from agent.memory import Memory
 from agent.session import Session, new_session_id
+from agent.tools import registry as registry_mod
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
-VERSION = "v0.8"
+VERSION = "v0.10"
 
 app = FastAPI(title="mini-agent", version=VERSION)
 
@@ -118,6 +119,9 @@ def get_agent(session_id: str) -> AgentLoop:
 class ChatRequest(BaseModel):
     session_id: str
     message: str
+    # v0.10：要不要带工具。默认 True —— 这是 Agent，不是聊天机器人。
+    # 前端会在两种模式之间切（见 web/index.html 的 mode 选择）。
+    use_tools: bool = True
 
 
 class MemoryRequest(BaseModel):
@@ -170,6 +174,29 @@ async def info() -> dict[str, Any]:
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest) -> dict[str, Any]:
+    """非流式的一轮。**这是唯一能带工具的端点**（v0.10）。
+
+    v0.10 的关键改动只有一处：调用的方法从 agent.run 换成 agent.run_with_tools。
+
+        改前  agent.run(req.message)              1 次模型往返，永远不调工具
+        改后  agent.run_with_tools(req.message)   1~N 次模型往返，会调工具
+
+    为什么流式端点不能这么改？（这是本周最值得想清楚的一件事）
+        stream() 是**生成器**，它 yield 的是「一个字的片段」。
+        而工具调用需要先拿到**完整的** tool_calls 列表才能决定下一步：
+        你必须知道模型点了哪些函数、参数是什么，才能去执行。
+        边收字边决定「要不要转去执行工具」是做不到的 ——
+        前 20 个字到达时，你根本不知道这一轮会不会产生 tool_calls。
+
+        所以真实系统的做法是「流式说话 + 非流式干活」：
+        一轮里先流式收文本，一旦发现这一轮要 tool_calls，
+        就在那个位置切到非流式完成工具循环，前端仍感知为一条流。
+        **本项目分两步走**，这一步先只做非流式，切换逻辑是第 2 步。
+
+    代价（这一版确实有的）：
+        带工具时，前端会「等几秒才出一整段字」，没有打字机效果。
+        这个丑是必要的 —— 它让你亲眼看到「这里必须切换」。
+    """
     agent = get_agent(req.session_id)
 
     # 把同步调用丢进线程池，别堵住事件循环。
@@ -182,14 +209,34 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
     # run_in_executor 三个参数：线程池（None = 默认的）、要调的函数
     # （**只写函数名不加括号**）、它的位置参数。返回可等待对象，必须 await。
     # 效果：httpx.post 在另一个线程里等，事件循环那个线程空出来接待新请求。
+    #
+    # ⚠️ 工具调用让这件事**更重要**了：一次工具轮是 2 次串行的模型往返，
+    #    实测要 4~8 秒。不丢线程池，这几秒内整个服务都是僵的。
     loop = asyncio.get_running_loop()
-    reply = await loop.run_in_executor(None, agent.run, req.message)
+
+    if req.use_tools and agent.tools is not None:
+        # run_with_tools 有第二个参数 max_iterations，这里用默认值 5。
+        # run_in_executor 只传**一个**位置参数 —— 想改 max_iterations
+        # 就得用 functools.partial 包一层，这是另一个值得记住的坑。
+        reply = await loop.run_in_executor(None, agent.run_with_tools, req.message)
+    else:
+        reply = await loop.run_in_executor(None, agent.run, req.message)
 
     return {
         "session_id": req.session_id,
         "reply": reply,
         "usage": agent.last_usage,
         "compact_count": agent.compact_count,
+        # v0.10：这两个数字只能由内核给。入口层拿到的是字符串，
+        # 字符串里没有「调了几次工具」—— 让入口层数 messages 的话，
+        # 数到的是**会话累计**而非这一轮，越聊越离谱。
+        #
+        # ⚠️ getattr 默认值不是「防御性编程」，而是**骨架期的必要兜底**：
+        #    last_tool_calls 由 loop.py 的 TODO 提供，用户还没补时这一行会
+        #    AttributeError 让整个端点 500 —— 而 reply 明明已经算出来了。
+        #    一个纯装饰性的计数项不该有能力搞垮整个响应。
+        "tool_calls": getattr(agent, "last_tool_calls", None),
+        "streamed": False,
     }
 
 
@@ -201,6 +248,13 @@ async def chat(req: ChatRequest) -> dict[str, Any]:
 @app.post("/api/stream")
 async def stream(req: ChatRequest) -> StreamingResponse:
     """SSE 流式：每收到一小段就推给浏览器，做出打字机效果。
+
+    ⚠️ **这个端点不支持工具**（v0.10 明确边界）。要带工具请走 /api/chat。
+    原因见 /api/chat 的 docstring —— 工具调用需要先拿到完整的 tool_calls
+    才能决定下一步，而流式是一次一个字地到达。
+
+    请求里如果带了 use_tools=True，这里会**明确拒绝**，
+    而不是悄悄降级成不调工具 —— 静默降级会让人以为工具坏了。
 
     为什么这个端点不用 run_in_executor？
         因为 StreamingResponse 收到**同步生成器**时，Starlette 自己会把它
@@ -215,10 +269,26 @@ async def stream(req: ChatRequest) -> StreamingResponse:
          data: [DONE]      ← 自定义的结束标记，前端收到就停止读取
 
     注意 get_agent() 是放在 generate() **里面**调的：
-        这样万一它抛错（比如 TODO ② 还没补），错误会变成一条 SSE 消息
+        这样万一它抛错，错误会变成一条 SSE 消息
         送到前端显示，而不是变成一个干巴巴的 HTTP 503 ——
         前端只需要一套错误处理逻辑。
     """
+    if req.use_tools:
+
+        async def reject() -> Iterator[str]:
+            payload = json.dumps(
+                {"error": "流式端点暂不支持工具调用（一次工具轮需要先拿到完整的 "
+                          "tool_calls 列表才能决定下一步，而流式是一个字一个字到的）。"
+                          "请改用 POST /api/chat。"},
+                ensure_ascii=False,
+            )
+            yield f"data: {payload}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            reject(), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     def generate() -> Iterator[str]:
         try:
@@ -285,6 +355,33 @@ async def history(session_id: str) -> dict[str, Any]:
             if m.get("role") in ("user", "assistant") and m.get("content")
         ],
     }
+
+
+@app.get("/api/tools")
+async def list_tools() -> list[dict[str, Any]]:
+    """列出可用的工具。给前端显示「我能干什么」用。
+
+    为什么这个端点**故意不经过 get_agent()**？
+        工具是从 agent/tools/ 目录扫出来的（registry.discover），
+        跟哪个会话无关 —— 建一个 AgentLoop 实例只为拿工具名，
+        会白白在内存里挂一整个会话。跟 /api/history /api/metrics 同一个理由：
+        只读就别造状态。
+    """
+    reg = registry_mod.discover()
+    out = []
+    # 注意：ToolRegistry 只有 names() / schema_list() / call() 三个公开方法，
+    # **没有 get(name)**。所以只能从 schema_list() 里按名字过滤。
+    # （想「凭名字拿一个工具」就得自己加 get 方法 —— 那是对 registry 的一个合理扩展，
+    #   但现在不需要，别为了顺手而改内核。）
+    for schema in reg.schema_list():
+        fn = schema.get("function", {})
+        props = (fn.get("parameters", {}) or {}).get("properties", {}) or {}
+        out.append({
+            "name": fn.get("name", ""),
+            "description": (fn.get("description") or "").strip(),
+            "params": list(props.keys()),
+        })
+    return sorted(out, key=lambda t: t["name"])
 
 
 @app.get("/api/metrics")

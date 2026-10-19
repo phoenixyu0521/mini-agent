@@ -44,6 +44,13 @@ header code{font-size:12px;background:var(--ai-bg);padding:1px 6px;border-radius
 @media (prefers-color-scheme:dark){.bubble.err{background:#3a1d1d;color:#f8b4b4;border-color:#5a2a2a}}
 .caret{display:inline-block;width:7px;height:14px;background:var(--accent);vertical-align:-2px;animation:blink 1s steps(1) infinite}
 @keyframes blink{50%{opacity:0}}
+#toolsBtn{border-color:var(--accent);color:var(--accent)}
+.tools{margin:0 18px;padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:var(--panel);font-size:12px;color:var(--muted);line-height:1.7;display:none}
+.tools.on{display:block}
+.tools b{color:var(--text);font-weight:500}
+.bubble .meta{margin-top:6px;font-size:11px;color:var(--muted);white-space:nowrap}
+.row.user .meta{color:var(--user-fg);opacity:.75}
+.waiting .bubble{color:var(--muted)}
 #inputWrap{display:flex;gap:10px;align-items:flex-end;padding:12px 18px 16px;border-top:1px solid var(--border)}
 #input{flex:1;resize:none;font:inherit;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg);color:var(--text);max-height:160px;outline:none}
 #input:focus{border-color:var(--accent)}
@@ -64,8 +71,10 @@ header code{font-size:12px;background:var(--ai-bg);padding:1px 6px;border-radius
     <span class="dot"></span>
     <span id="model">…</span>
     <code id="sid"></code>
+    <button id="toolsBtn" title="切换：Agent 模式（带工具，不流式） /聊天模式（流式）">Agent 模式</button>
   </header>
   <div id="messages"></div>
+  <div class="tools" id="toolBox"></div>
   <div id="inputWrap">
     <textarea id="input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
     <button id="send">发送</button>
@@ -76,6 +85,48 @@ header code{font-size:12px;background:var(--ai-bg);padding:1px 6px;border-radius
 const $ = (id) => document.getElementById(id);
 let sessionId = null;
 let busy = false;
+// v0.10：两种模式，对应两个后端端点。
+//   agentMode = true  → POST /api/chat   （带工具，不流式，要等几秒）
+//   agentMode = false → POST /api/stream （不流式，逐字出）
+// ⚠️ 不是「哪个更好」，是「能力不同」：工具调用需要先拿到完整的 tool_calls
+//    列表才能决定下一步，而流式是一个字一个字到的。这第 4 周第 2 步会解决。
+let agentMode = true;
+
+// 给一条 AI 气泡挂上元信息（token / 工具次数）
+function addMeta(bubble, info) {
+  if (!info) return;
+  const parts = [];
+  const u = info.usage || {};
+  if (u.prompt_tokens || u.completion_tokens) {
+    parts.push(`tokens ${u.prompt_tokens || 0}+${u.completion_tokens || 0}`);
+  }
+  if (info.tool_calls) parts.push(`调了 ${info.tool_calls} 次工具`);
+  if (info.elapsed_ms) parts.push(`${(info.elapsed_ms / 1000).toFixed(1)}s`);
+  if (!parts.length) return;
+  let m = bubble.querySelector(".meta");
+  if (!m) {
+    m = document.createElement("div");
+    m.className = "meta";
+    bubble.appendChild(m);
+  }
+  m.textContent = parts.join(" · ");
+}
+
+async function loadTools() {
+  try {
+    const list = await (await fetch("/api/tools")).json();
+    const box = $("toolBox");
+    if (!list.length) {
+      box.innerHTML = "<b>没有发现任何工具</b><br>检查 agent/tools/ 下的文件";
+      return;
+    }
+    box.innerHTML =
+      "<b>可用的工具</b>（每轮请求都会把它们的说明书重发一遍，是固定开销）<br>" +
+      list.map((t) => `·<b>${t.name}</b>${t.params.length ? "(" + t.params.join(", ") + ")" : ""} —— ${t.description}`).join("<br>");
+  } catch (e) {
+    $("toolBox").innerHTML = "读取工具列表失败：" + e.message;
+  }
+}
 
 function fmtId(id) {
   // 20261011-143000 → 10-11 14:30
@@ -155,6 +206,50 @@ async function newSession() {
   renderSessions(info);
 }
 
+// ══════════════════════════════════════════════════════════
+//  v0.10：Agent 模式 —— 非流式 + 带工具
+//
+//  和流式的区别只有两处：
+//    1. 端点是 /api/chat（不是 /api/stream），请求里带 use_tools: true
+//    2. 拿不到增量，只能等全部算完 —— 所以要先显示一个等待占位
+//
+//  为什么不能等一个「中间进度」出来？
+//    因为工具循环整体是一次 run_in_executor 里的同步调用，
+//    中间状态在另一个线程里。v0.10 第 2 步会把这个切换点暴露成 SSE 事件。
+// ══════════════════════════════════════════════════════════
+async function sendAgentMode(text) {
+  const t0 = Date.now();
+  const row = document.createElement("div");
+  row.className = "row ai waiting";
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  bubble.textContent = "…";
+  row.appendChild(bubble);
+  $("messages").appendChild(row);
+  scrollDown();
+
+  const resp = await fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId, message: text, use_tools: true }),
+  });
+  const data = await resp.json();
+  row.classList.remove("waiting");
+
+  if (!resp.ok) {
+    bubble.textContent = data.detail || ("HTTP " + resp.status);
+    bubble.classList.add("err");
+    return;
+  }
+  bubble.textContent = data.reply;
+  addMeta(bubble, {
+    usage: data.usage,
+    tool_calls: data.tool_calls,
+    elapsed_ms: Date.now() - t0,
+  });
+  scrollDown();
+}
+
 async function send() {
   const input = $("input");
   const text = input.value.trim();
@@ -166,6 +261,21 @@ async function send() {
   input.style.height = "auto";
 
   addBubble("user", text);
+
+  if (agentMode) {
+    try {
+      await sendAgentMode(text);
+    } catch (e) {
+      addBubble("ai", "[连接失败：" + e.message + "]").classList.add("err");
+    }
+    busy = false;
+    $("send").disabled = false;
+    input.focus();
+    const info = await loadInfo();
+    renderSessions(info);
+    return;
+  }
+
   const bubble = addBubble("ai", "");
   const caret = document.createElement("span");
   caret.className = "caret";
@@ -176,7 +286,9 @@ async function send() {
     const resp = await fetch("/api/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: sessionId, message: text }),
+      // ⚠️ use_tools 必须显式写 false。后端的默认值是 true，
+      //    不写会被「流式端点不支持工具」那条逻辑挡下来。
+      body: JSON.stringify({ session_id: sessionId, message: text, use_tools: false }),
     });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
 
@@ -229,6 +341,18 @@ async function send() {
 $("send").onclick = send;
 $("newBtn").onclick = newSession;
 
+// 模式切换。**Agent 模式才显示工具清单** —— 聊天模式下它们根本不会被发送，
+// 显示出来只会让人以为「它有工具却不用」。
+function syncMode() {
+  const btn = $("toolsBtn");
+  btn.textContent = agentMode ? "Agent 模式" : "聊天模式";
+  $("toolBox").classList.toggle("on", agentMode);
+}
+$("toolsBtn").onclick = () => {
+  agentMode = !agentMode;
+  syncMode();
+};
+
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
@@ -238,6 +362,8 @@ $("input").addEventListener("input", (e) => {
 });
 
 (async () => {
+  syncMode();
+  loadTools();
   try {
     const list = await loadInfo();
     if (list.length) await openSession(list[0].id);
