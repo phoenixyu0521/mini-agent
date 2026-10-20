@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as pkg_version
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -42,7 +44,20 @@ from agent.session import Session, new_session_id
 from agent.tools import registry as registry_mod
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
-VERSION = "v0.10"
+
+# 版本号只留**一个**来源：pyproject.toml 的 version。
+#
+# 为什么值得专门写三行来做这件事？
+#     因为打包这一步让「两份版本号」第一次真正撞车了 ——
+#     pyproject 已改成 0.11.0，而这里还手写着 v0.10，
+#     于是 /api/info 对外报的是旧版本。**这种错不会报错，只会骗人。**
+#
+#     和「Key 只能有一个来源」是同一条原则：能推导的东西，不要抄写。
+try:
+    VERSION = "v" + pkg_version("mini-agent")
+except PackageNotFoundError:
+    # 没装进环境（例如裸 `python server.py`）时的降级：宁可显示 dev，也不编一个号
+    VERSION = "dev"
 
 app = FastAPI(title="mini-agent", version=VERSION)
 

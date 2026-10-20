@@ -37,29 +37,56 @@ mini-agent/
 ├── .venv/              # 虚拟环境（uv 自动创建，不进 Git）
 ```
 
+## 快速开始（换台机器照这个走）
+
+```bash
+# 1) 装 uv（仅新机器需要，已装可跳过）
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# 2) 配 Key（仅第一次）
+copy .env.example .env        # macOS / Linux 用 cp
+# 编辑 .env，把模型接口地址、模型名、API Key 填上
+
+# 3) 一条命令起 Web
+uv run mini-agent-server
+```
+
+浏览器打开 http://127.0.0.1:8000 。
+
+`uv run` 一件事全干了：读 `pyproject.toml` → 建 `.venv` → 按 `uv.lock` 装依赖 → 执行命令。
+**不需要先 `pip install`，也不需要手动激活虚拟环境。**
+
+> 命令是从 `[project.scripts]` 来的，等价于 `uv run python server.py`。
+> 好处是换机器不用记「哪个文件是入口」。
+
 ## 常用命令
 
 在本目录下执行（PyCharm 用 `Alt + F12` 打开内置 Terminal，它会自动停在本目录）：
 
 ```bash
 uv add <包名>                    # 装依赖 —— .venv 在这一刻自动出现
+uv add --dev <包名>              # 只装开发期用的（如 pytest），不进运行时依赖
 uv sync                          # 按 uv.lock 把环境恢复成一致状态
+uv run pytest                    # 跑全部单测
 
-uv run python stage0_check.py    # 阶段 0 验收：调通模型接口
-uv run python cli.py "你好"       # 单轮提问
-uv run python cli.py             # 交互模式（多轮对话）
-uv run python cli.py --stream    # 交互模式 + 流式输出
-uv run python cli.py --tools     # 【第 2 周】交互模式 + 工具
+uv run mini-agent-server         # 第 4 周：起 Web 界面（窗口要一直开着）
+uv run mini-agent "你好"          # 单轮提问
+uv run mini-agent                # 交互模式（多轮对话）
+uv run mini-agent --stream       # 交互模式 + 流式输出
+uv run mini-agent --tools        # 【第 2 周】交互模式 + 工具
 
-uv run python cli.py --sessions                    # 【第 3 周】列出最近的会话
-uv run python cli.py --resume 20261010-142117      # 恢复指定会话
-uv run python cli.py --new-session                 # 强制开新会话
-uv run python cli.py --no-compact                  # 【第 3 周】关掉上下文压缩
-uv run python cli.py --no-memory                   # 【第 3 周】关掉长期记忆
+uv run mini-agent --sessions                    # 【第 3 周】列出最近的会话
+uv run mini-agent --resume 20261010-142117      # 恢复指定会话
+uv run mini-agent --new-session                 # 强制开新会话
+uv run mini-agent --no-compact                  # 【第 3 周】关掉上下文压缩
+uv run mini-agent --no-memory                   # 【第 3 周】关掉长期记忆
 
-uv run python cli.py --profiles                    # 【第 3 周】列出配置档案
-uv run python cli.py --profile deepseek "你好"      # 【第 3 周】换一套配置跑
+uv run mini-agent --profiles                    # 【第 3 周】列出配置档案
+uv run mini-agent --profile smart "你好"         # 【第 3 周】换一套配置跑
 ```
+
+> `uv run python cli.py ...` 和 `uv run mini-agent ...` 完全等价，前者也仍然可用。
+> 打包之后推荐用后者 —— 它不依赖「你在哪个目录」。
 
 交互模式内置命令：`/reset` 清空上下文，`/history` 查看消息列表，
 `/tokens` 看裁剪是否生效，`/compact` 看压缩统计，

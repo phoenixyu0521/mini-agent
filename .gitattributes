@@ -1,0 +1,17 @@
+# 统一行尾，否则 Windows 上改一行会变成「整个文件都变了」
+#
+# 这次就踩了：README 只加了 50 行，diff 却显示 943 行 ——
+# 原因是写入时行尾从 LF 变成了 CRLF，git 认为每一行都改了。
+# 行尾混用不会报错，只会让 diff、blame、code review 全部失真。
+#
+# 规则：仓库里一律存 LF；检出时也保持 LF（现代编辑器都认）。
+* text=auto eol=lf
+
+# 二进制文件不做任何转换（转换会直接损坏文件）
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.woff2 binary

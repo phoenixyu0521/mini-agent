@@ -1,6 +1,6 @@
 [project]
 name = "mini-agent"
-version = "0.1.0"
+version = "0.11.0"
 description = "从零手写的 Agent 内核（4 周学习项目）"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -11,6 +11,33 @@ dependencies = [
     "python-dotenv>=1.2.3",
     "uvicorn[standard]>=0.54.0",
 ]
+
+# ── 一条命令启动（第 4 周：打包）──────────────────────────
+# 这两行把「模块里的 main()」注册成系统命令：
+#     mini-agent          →  cli:main    （终端对话）
+#     mini-agent-server   →  server:main （Web 界面）
+#
+# 注意它**不是** shell 别名 —— 装完之后这些命令是 uv 环境里的真可执行文件，
+# 所以换台机器只要 `uv run mini-agent` 就行，不用记 python xxx.py 的路径。
+[project.scripts]
+mini-agent = "cli:main"
+mini-agent-server = "server:main"
+
+# ── 为什么必须有 build-system ─────────────────────────────
+# 有 [project.scripts] 时，uv 必须先把「这个项目」安装进环境，
+# 才能生成那些命令。没有构建后端它不知道该按什么规则打包 →
+# 报 "build backend not found"。setuptools 对「扁平布局」最宽容。
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# 顶层的两个入口是「模块」不是「包」，要单独列出来
+py-modules = ["cli", "server"]
+
+[tool.setuptools.packages.find]
+# 只收 agent/ 这一个包；tests/ 没有 __init__.py，不会被误收
+include = ["agent*"]
 
 [dependency-groups]
 dev = [

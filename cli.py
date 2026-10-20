@@ -2,19 +2,19 @@
 
 用法：
 
-    uv run python cli.py "你好"              单轮：问一句就退出（验 v0.1）
-    uv run python cli.py                     交互模式，连续对话（验多轮记忆）
-    uv run python cli.py --stream            交互模式 + 流式输出（验 v0.2）
-    uv run python cli.py --tools "现在几点"   带工具：模型能自己调函数（验 v0.3）
+    uv run mini-agent "你好"              单轮：问一句就退出（验 v0.1）
+    uv run mini-agent                     交互模式，连续对话（验多轮记忆）
+    uv run mini-agent --stream            交互模式 + 流式输出（验 v0.2）
+    uv run mini-agent --tools "现在几点"   带工具：模型能自己调函数（验 v0.3）
 
-    uv run python cli.py --sessions          第 3 周：列出最近的会话然后退出
-    uv run python cli.py --resume 20261010-140032    恢复指定会话
-    uv run python cli.py --new-session       强制开一个新会话
-    uv run python cli.py --no-compact        关闭上下文自动压缩（看 token 一直涨）
-    uv run python cli.py --no-memory         关闭长期记忆注入（对比有没有记忆的差别）
+    uv run mini-agent --sessions          第 3 周：列出最近的会话然后退出
+    uv run mini-agent --resume 20261010-140032    恢复指定会话
+    uv run mini-agent --new-session       强制开一个新会话
+    uv run mini-agent --no-compact        关闭上下文自动压缩（看 token 一直涨）
+    uv run mini-agent --no-memory         关闭长期记忆注入（对比有没有记忆的差别）
 
-    uv run python cli.py --profiles          第 3 周第四块：列出 config.json 里的配置档案
-    uv run python cli.py --profile deepseek  换一套配置跑（模型 / 超时 / max_tokens 全变）
+    uv run mini-agent --profiles          第 3 周第四块：列出 config.json 里的配置档案
+    uv run mini-agent --profile deepseek  换一套配置跑（模型 / 超时 / max_tokens 全变）
 
 第 2 周新增的是 `--tools`。它做两件事：
     1. 让 AgentLoop 去扫描 agent/tools/ 目录，把工具收进注册表
@@ -134,7 +134,7 @@ def main() -> None:
         for name in names:
             mark = " ←默认" if name == default_name else ""
             print(f"  {name}{mark}")
-        print("\n切换方式：uv run python cli.py --profile <名字>")
+        print("\n切换方式：uv run mini-agent --profile <名字>")
         return
 
     # ── --sessions：列完就退，不需要 Key，也不需要联网 ──────
@@ -153,7 +153,7 @@ def main() -> None:
                 continue
             detail = "、".join(f"{r} {n}" for r, n in sorted(info["roles"].items()))
             print(f"  {info['id']}  {info['created_at']}  {info['message_count']} 条（{detail}）")
-        print("\n恢复某个会话：uv run python cli.py --resume <编号>")
+        print("\n恢复某个会话：uv run mini-agent --resume <编号>")
         return
 
     # 开头就把配置验一遍。
