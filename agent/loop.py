@@ -19,7 +19,7 @@ from contextlib import nullcontext
 from functools import partial
 from typing import Any, Iterator
 
-from agent import config, context, llm, mcp, metrics
+from agent import config, context, llm, mcp, metrics, skills
 from agent.memory import Memory
 from agent.session import Session
 from agent.tools import registry
@@ -112,6 +112,10 @@ class AgentLoop:
         self.memory = memory
         # 本轮的长期记忆消息（还没注入时是 None）
         self._memory_message: dict[str, str] | None = None
+        # 技能目录消息。惰性算一次就缓存 —— 它整轮不变，
+        # 每轮重算等于白扫一遍磁盘。
+        self._skill_message: dict[str, Any] | None = None
+        self._skill_loaded = False
         # 第 4 周：v0.9 可观测性。造哪台由入口决定（CLI / HTTP），
         # 所以这里默认是「不记」—— 记不记是一种策略，不该硬编码在核心里。
         self.meter: metrics.Meter | None = None
@@ -329,15 +333,44 @@ class AgentLoop:
             越靠后越「新」。长期记忆是背景资料，不是新发生的事，
             所以它必须在最前面。
         """
-        if self._memory_message is None:
-            return view
         if not view:
             return view
 
         # 不修改传进来的 view —— 用切片拼新的。
         # 虽然这里 view 通常已经是临时对象了，但保持「不改参数」的习惯，
         # 能避免以后有人把 self.messages 直接传进来时踩雷。
-        return [view[0], self._memory_message, *view[1:]]
+        #
+        # ⚠️ 这里不能再写「没有记忆就直接 return」—— 技能目录是**独立**的一份上下文，
+        # 没有长期记忆不代表没有技能。两者各自判断，谁有就插谁。
+        head = [view[0]]
+        if self._memory_message is not None:
+            head.append(self._memory_message)
+
+        # 技能目录：只给「名字 + 一句话」，全文靠 load_skill 按需读。
+        # 位置紧跟记忆、在摘要之前 —— 它们都属于「一开始就该知道的背景」，
+        # 不是「刚才发生的事」。
+        skill_block = self._skill_block()
+        if skill_block is not None:
+            head.append(skill_block)
+
+        if len(head) == 1:
+            return view
+        return [*head, *view[1:]]
+
+    def _skill_block(self) -> dict[str, Any] | None:
+        """技能目录消息。算一次就缓存。
+
+        为什么只在启用工具时注入？
+            因为没有 load_skill 这个工具，模型拿到目录也读不到全文，
+            只会照着名字自己编流程 —— 那比不告诉它还糟。
+        """
+        if self.tools is None:
+            return None
+        if not self._skill_loaded:
+            text = skills.get_loader().summary()
+            self._skill_message = {"role": "system", "content": text} if text else None
+            self._skill_loaded = True
+        return self._skill_message
 
     # ── 第 3 周：会话持久化（脚手架，已写完整）───────────────
     # 这两个方法是「接线」，不含 Agent 原理，所以直接给全。
