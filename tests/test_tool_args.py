@@ -120,7 +120,24 @@ def test_unknown_tool_returns_error_string():
 
     ⚠️ 别写成 `with pytest.raises(...)` —— 这里要证明的恰恰是「不抛」。
     """
-    raise NotImplementedError("TODO ①：断言未知工具返回错误串且不抛异常")
+    registry = ToolRegistry()
+    result = registry.call("no_such_tool", {})
+
+    # 两个断言缺一不可：
+    #   前缀      → 证明它走的是「转字符串」这条路，而不是默默返回空串
+    #   名字在里面 → 证明模型拿到了足够信息去纠正（否则它不知道该改什么）
+    assert result.startswith("[错误]")
+    assert "no_such_tool" in result
+
+
+class _Boom(Tool):
+    """专门用来炸的工具。"""
+
+    name = "boom"
+    description = "总是失败"
+
+    def run(self, **kwargs: object) -> str:
+        raise ValueError("boom")
 
 
 def test_tool_exception_becomes_error_string():
@@ -138,4 +155,13 @@ def test_tool_exception_becomes_error_string():
         也不是在 loop 里。所以这条测试其实在给 registry 的一个契约上锁：
         **局部失败不该拖垮整轮对话。**
     """
-    raise NotImplementedError("TODO ②：断言工具异常被转成错误串")
+    registry = ToolRegistry()
+    registry.register(_Boom())
+
+    # 这一行如果抛异常，测试直接红 —— 那正是要防的事
+    result = registry.call("boom", {})
+
+    assert result.startswith("[错误]")
+    # 异常类型名必须留下：模型看到 "ValueError" 才知道是「我参数给错了」
+    # 还是「工具本身坏了」，两者的纠正策略完全不同
+    assert "ValueError" in result

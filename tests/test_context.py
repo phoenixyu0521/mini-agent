@@ -116,7 +116,11 @@ def test_keeps_the_tail_not_the_head(make_history, fake_summarize):
 
     提示：断言写具体字符串，别写 `assert len(view) > 2`。
     """
-    raise NotImplementedError("TODO ①：断言保留的是最后 8 条")
+    view = context.compact(make_history(30), fake_summarize)
+
+    # 保留区 = 最后 8 条 = "第22条" … "第29条"
+    assert view[2]["content"] == "第22条"
+    assert view[-1]["content"] == "第29条"
 
 
 def test_summarizer_gets_exactly_the_dropped_part(make_history, fake_summarize):
@@ -135,4 +139,9 @@ def test_summarizer_gets_exactly_the_dropped_part(make_history, fake_summarize):
         那条消息要么被**既保留又摘要**（重复计入 token），
         要么被**既没保留也没摘要**（模型直接失忆）。
     """
-    raise NotImplementedError("TODO ②：断言摘要器只收到被砍掉的那 22 条")
+    context.compact(make_history(30), fake_summarize)
+
+    dropped = fake_summarize.calls[0]
+    assert len(dropped) == 22
+    assert dropped[0]["content"] == "第0条"
+    assert dropped[-1]["content"] == "第21条"
