@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from functools import partial
 from typing import Any, Iterator
 
 from agent import context, llm, metrics
@@ -640,43 +642,35 @@ class AgentLoop:
                     for tc in tool_calls
                 ]
 
-            # ═══════════════════════════════════════════════════════
-            # TODO ① —— 让这批只读工具**真的**并行
+            # ── 并行分支：这批全是只读工具，可以同时跑 ──────────────
             #
-            #   现在的下一行代码是串行兜底（功能正确，只是不快）。
-            #   把那行换成线程池版本。
+            # 三个问题的答案：
             #
-            #   要 import：
-            #       from concurrent.futures import ThreadPoolExecutor
+            #   Q1 max_workers 填多少？
+            #      就填这批的条数（len(jobs)）。一轮能点几个工具受 max_iterations
+            #      约束，本来就不多；开等量线程刚好够用。
+            #      写死 8 只是让空闲线程白占内存 —— 线程的代价不是「慢」，是内存。
             #
-            #   三个动手前该答出来的问题：
+            #   Q2 怎么「并行跑、按原顺序拿回」？
+            #      `pool.map()` 的返回值**天然按输入顺序**给出，和谁先跑完无关。
+            #      它只吃一个位置参数，所以先用 partial 把 (name, args) 绑成
+            #      「待调用」，再用 lambda 把它调起来。
             #
-            #   Q1. max_workers 填多少？写死 8 行不行？
-            #       提示：模型一轮最多点几个工具？（看 max_iterations 的注释）
-            #             线程开多了的代价不是「慢」，是**每个线程都占内存**，
-            #             而且你根本不会有 8 个任务可跑。
-            #             有没有一个「刚好够用」的写法？
+            #   Q3 某个工具抛异常会拖垮同批吗？
+            #      不会。`self.tools.call()` 已经把一切异常吞成 "[错误] ..."
+            #      字符串了，线程里根本不会冒出异常。
+            #      ⚠️ 这个安全性来自 call()，**不是来自线程池** ——
+            #         哪天有人绕过 call() 直接 submit(tool.run)，一个异常就躺在
+            #         future 里，等你 .result() 时才炸。
             #
-            #   Q2. 怎么做到「并行跑、按原顺序拿回」？
-            #       提示：`pool.map(fn, 参数序列)` 返回的结果**天然保序**，
-            #             而且它自己会分发任务，不需要你排队。
-            #             但注意：map 的第一个参数只能吃**一个**位置参数。
-            #             你现在要传的是 (name, args) 两项 —— 怎么办？
-            #             （有个东西能把「调用」变成「待调用」，名字叫 partial）
-            #
-            #   Q3. 某个工具抛异常，会不会拖垮同批其他工具？
-            #       提示：`self.tools.call()` 已经把一切异常吞成 "[错误] ..." 字符串了，
-            #             所以这里天然安全。
-            #             但想清楚：这个安全性来自 call()，**不是来自线程池**。
-            #             哪天有人绕过 call() 直接 pool.submit(tool.run)，
-            #             一个异常就只在 future 里躺着，你 `.result()` 时才炸。
-            #
-            #   写完这行之后，串行兜底要删掉 —— 别留两条路，会有人走错那条。
-            # ═══════════════════════════════════════════════════════
-            return [
-                self.tools.call(tc.name, tc.parsed_arguments())
+            # `with` 退出时会等所有线程结束，所以 return 写在 with 里面是安全的：
+            # 能返回，就说明结果已经收齐了。
+            jobs = [
+                partial(self.tools.call, tc.name, tc.parsed_arguments())
                 for tc in tool_calls
             ]
+            with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+                return list(pool.map(lambda job: job(), jobs))
 
     def _run_tool_rounds(
         self,
