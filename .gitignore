@@ -10,6 +10,14 @@
 data/
 MEMORY.md
 
+# ===== MCP server 的索引数据 =====
+# 里面是别人文档的全文（hello-agents 教程）+ 7 MB 的 FTS5 索引。
+# 不进仓库有两个理由：
+#   1. 那是别人的内容。仓库该包含「怎么建索引」，不该包含索引本身。
+#   2. 7 MB 的二进制文件进 git，以后每次改动都很丑。
+# 用法：先跑 `uv run python -m mcp_servers.build_index` 生成。
+mcp_servers/data/
+
 # ===== 虚拟环境 =====
 .venv/
 venv/
