@@ -37,6 +37,7 @@ from pydantic import BaseModel
 
 from agent import config as config_mod
 from agent import llm
+from agent import mcp
 from agent import metrics as metrics_mod
 from agent.loop import AgentLoop
 from agent.memory import Memory
@@ -83,6 +84,22 @@ async def _todo_not_done(request: Request, exc: NotImplementedError) -> JSONResp
 
 _agents: dict[str, AgentLoop] = {}
 
+# MCP 配置只读一次。为什么缓存？
+#   config.json 在进程生命周期内不会变 —— 改了要重启服务（既有约定）。
+#   而 _build_agent() 每建一个会话都会调它，不缓存就是每次读一遍磁盘。
+_mcp_servers_cache: dict[str, Any] | None = None
+
+
+def _mcp_servers() -> dict[str, Any]:
+    global _mcp_servers_cache
+    if _mcp_servers_cache is None:
+        try:
+            _mcp_servers_cache = config_mod.resolve().mcp_servers
+        except (config_mod.ConfigError, llm.ConfigError):
+            # 配置有问题时不要连累工具加载 —— /api/info 会单独把配置错误报出来
+            _mcp_servers_cache = {}
+    return _mcp_servers_cache
+
 
 def _build_agent(session_id: str) -> AgentLoop:
     """造一个接好 session / memory 的 AgentLoop。脚手架，已写好。
@@ -93,7 +110,12 @@ def _build_agent(session_id: str) -> AgentLoop:
     这个「先读、读不到才写」的顺序不能反 —— 反了会把已有会话清空。
     """
     session = Session.load(session_id)
-    agent = AgentLoop(with_tools=True, session=session, memory=Memory())
+    agent = AgentLoop(
+        with_tools=True,
+        session=session,
+        memory=Memory(),
+        mcp_servers=_mcp_servers(),
+    )
     if not agent.load_session():
         session.start(agent.messages[0]["content"])
     agent.load_memory()
@@ -370,11 +392,12 @@ async def list_tools() -> list[dict[str, Any]]:
         只读就别造状态。
     """
     reg = registry_mod.discover()
+    # 把 MCP 工具也列出来 —— 否则「工具列表」和「模型实际能用的工具」会不一致，
+    # 而界面上的列表是用户判断「为什么它不调工具」的唯一依据。
+    mcp.attach(reg, _mcp_servers())
     out = []
-    # 注意：ToolRegistry 只有 names() / schema_list() / call() 三个公开方法，
-    # **没有 get(name)**。所以只能从 schema_list() 里按名字过滤。
-    # （想「凭名字拿一个工具」就得自己加 get 方法 —— 那是对 registry 的一个合理扩展，
-    #   但现在不需要，别为了顺手而改内核。）
+    # 用 schema_list() 而不是遍历内部 dict：registry 的公开接口就是那几个，
+    # 想加能力就加方法（get() 就是这么来的），别绕过封装去摸私有字段。
     for schema in reg.schema_list():
         fn = schema.get("function", {})
         props = (fn.get("parameters", {}) or {}).get("properties", {}) or {}

@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from typing import Any
 
 from agent import config as config_mod
 from agent import context, llm
@@ -112,6 +113,18 @@ def parse_args() -> argparse.Namespace:
         help="列出 config.json 里所有可用的配置档案然后退出",
     )
     return parser.parse_args()
+
+
+def _load_mcp_servers(profile: str | None) -> dict[str, Any]:
+    """读 config.json 顶层的 mcpServers。
+
+    配错了就当「没有 MCP」，而不是让 CLI 起不来 ——
+    MCP 是可选能力，配置文件里一个逗号写错不该导致整个对话功能不可用。
+    """
+    try:
+        return config_mod.resolve(profile).mcp_servers
+    except (config_mod.ConfigError, llm.ConfigError):
+        return {}
 
 
 def main() -> None:
@@ -199,6 +212,7 @@ def main() -> None:
         session=session,
         auto_compact=not args.no_compact,
         memory=None if args.no_memory else Memory(),
+        mcp_servers=_load_mcp_servers(args.profile) if args.tools else None,
     )
 
     # 恢复还是新建？只有读完才知道 —— 新建的 session 文件还不存在。

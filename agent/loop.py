@@ -19,7 +19,7 @@ from contextlib import nullcontext
 from functools import partial
 from typing import Any, Iterator
 
-from agent import config, context, llm, metrics
+from agent import config, context, llm, mcp, metrics
 from agent.memory import Memory
 from agent.session import Session
 from agent.tools import registry
@@ -38,6 +38,7 @@ class AgentLoop:
         session: Session | None = None,
         auto_compact: bool = True,
         memory: Memory | None = None,
+        mcp_servers: dict[str, Any] | None = None,
     ) -> None:
         # 全部记忆就是一个列表。
         # 第 0 条是「规矩」，它定义它是谁、怎么说话 —— 这一条永不改变，
@@ -58,7 +59,15 @@ class AgentLoop:
         # 第 2 周：只有明说要工具时才去扫描工具目录。
         # 为什么默认关着？因为工具说明书每一轮都要重发 ——
         # 实测 1 个工具就让 prompt_tokens 从 17 涨到 276。用不上就别付这笔钱。
-        self.tools = registry.discover() if with_tools else None
+        #
+        # 第 4 周补 MCP：本地工具扫完之后，再把「住在别的进程里」的工具接进来。
+        # 注意 loop 这一层**完全不知道 MCP 的存在** —— 它只是往同一个
+        # ToolRegistry 里多注册几个 Tool。协议细节全在 agent/mcp/ 里。
+        if with_tools:
+            self.tools = registry.discover()
+            mcp.attach(self.tools, mcp_servers or {})
+        else:
+            self.tools = None
 
         # ── 第 3 周：会话持久化 ──────────────────────────────
         # 有了它，程序重启后能接着上次聊。

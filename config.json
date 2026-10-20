@@ -15,5 +15,23 @@
       "timeout": 180,
       "context_window": 128000
     }
+  },
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "D:\\WorkBuddy\\nanobot\\mini-agent\\docs"
+      ],
+      "enabledTools": [
+        "list_allowed_directories",
+        "list_directory",
+        "read_text_file",
+        "search_files",
+        "directory_tree"
+      ],
+      "toolTimeout": 60
+    }
   }
 }

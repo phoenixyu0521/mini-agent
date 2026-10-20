@@ -158,6 +158,10 @@ TEMPLATE: dict[str, Any] = {
             "context_window": DEFAULT_CONTEXT_WINDOW,
         },
     },
+    # MCP server 列表。空对象 = 不用 MCP。
+    # 放在**顶层**而不是某个 profile 里，因为它跟「用哪个模型」无关 ——
+    # 换模型不该导致工具消失。
+    "mcpServers": {},
 }
 
 
@@ -189,6 +193,9 @@ class Config:
         self.timeout = int(data["timeout"])
         # 窗口大小：老配置文件没有这一项，兜底成默认值（不该因为缺字段就崩）
         self.context_window = int(data.get("context_window") or DEFAULT_CONTEXT_WINDOW)
+        # MCP server 配置。同样兜底成空 dict —— 老配置文件里没有这一项，
+        # 但「没有 MCP」和「配置坏了」是两件事，前者不该报错。
+        self.mcp_servers: dict[str, Any] = dict(data.get("mcp_servers") or {})
         self.base_url = str(data["base_url"]).rstrip("/")
         self.url = self.base_url + "/chat/completions"
         self.api_key = api_key
@@ -351,6 +358,9 @@ def resolve(name: str | None = None) -> Config:
         "max_tokens": int(preset.get("max_tokens") or DEFAULT_MAX_TOKENS),
         "timeout": int(preset.get("timeout") or DEFAULT_TIMEOUT),
         "context_window": int(preset.get("context_window") or DEFAULT_CONTEXT_WINDOW),
+        # MCP 是顶层配置，不属于 profile。这里透传下去，
+        # Config 才是一个「自包含」的对象 —— 拿到 cfg 就知道该怎么连工具。
+        "mcp_servers": data.get("mcpServers") or {},
     }
 
     # d) API Key —— 唯一绝不兜底的一项
