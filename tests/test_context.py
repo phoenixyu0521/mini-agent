@@ -8,31 +8,92 @@
 
 ## 两个水位线（回顾）
 
-    KEEP_RECENT = 8    保留区：最近 8 条原样发
-    COMPACT_AT  = 12   超过 12 条对话就压
+    KEEP_RECENT = 8            保留区：最近 8 条原样发（按条数）
+    compact_budget(...)        预算：历史最多占多少 token（按 token）
 
-"条数" 不是 "轮数"：一轮普通对话 = 2 条（user + assistant），带工具时更多。
+2026-10-20 改：触发判据从「条数」换成「token 预算」。
+所以下面测「切分逻辑」的用例都显式传 `budget=FORCE_COMPACT`，
+把「要不要压」和「怎么压」解耦 —— 否则改判据会连带改一堆无关测试。
 """
 
 from __future__ import annotations
 
 from agent import context
 
+# 强制压缩用的极小预算：只要不是空列表就一定超。
+# 为什么不用 `budget=0`？—— `compact_budget()` 有 4000 的下限，
+# 但 `needs_compaction` 直接收 budget，不经过那个下限。用 1 语义更明确。
+FORCE_COMPACT = 1
+
 
 # ══════════════════════════════════════════════════════════
-#  水位线判定
+#  水位线判定：现在判的是 token，不是条数
 # ══════════════════════════════════════════════════════════
 
 
-def test_needs_compaction_boundary(make_history):
-    """边界要精确，差一条就是「每轮都压」或「永远不压」。
+def test_needs_compaction_by_tokens(make_history):
+    """⭐ 判据是 token 预算。
 
-    公式是 `len(messages) - 1 > COMPACT_AT`，减 1 是因为 system 不算对话。
-        12 条对话 → 13 条 messages → 12 > 12 为假
-        13 条对话 → 14 条 messages → 13 > 12 为真
+    这条用例锁住的是「用真实约束而不是代理指标」：
+        30 条短消息（每条 ~4 字符）→ 几十 token → 不压
+        少量但很长的消息 → 超预算 → 压
+
+    如果哪天有人把 `needs_compaction` 改回 `len(messages) > N`，
+    第二次断言会立刻红 —— 因为 4 条消息不可能触发条数水位线。
     """
-    assert context.needs_compaction(make_history(12)) is False
-    assert context.needs_compaction(make_history(13)) is True
+    short = make_history(30)
+    assert context.estimate_tokens(short) < 1000
+    assert context.needs_compaction(short, budget=10_000) is False
+
+    long_msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "x" * 40_000},
+        {"role": "assistant", "content": "y" * 40_000},
+        {"role": "user", "content": "z" * 40_000},
+    ]
+    assert context.estimate_tokens(long_msgs) > 50_000
+    assert context.needs_compaction(long_msgs, budget=10_000) is True
+
+
+def test_compact_budget_derivation():
+    """预算 = 窗口 - 输出额度 - 安全余量，且不会算出非正数。"""
+    assert context.compact_budget(128_000, 8_192) == 128_000 - 8_192 - context.SAFETY_BUFFER_TOKENS
+    # 极端配置（窗口比输出还小）不能返回负数，否则「永远超预算」
+    assert context.compact_budget(1_000, 8_192) == 4_000
+
+
+def test_compaction_never_splits_tool_call_pair():
+    """⭐ 切点不能落在 assistant(tool_calls) 和它的 tool 结果之间。
+
+    否则保留区的第一条是一条「没有声明者的 tool 消息」——
+    服务商直接 400（tool_call_id 找不到对应声明），
+    而且报错发生在**下一轮**，很难联想到是裁剪造成的。
+
+    构造：让 tool 消息正好落在 `len - KEEP_RECENT` 的位置上。
+    """
+    messages = [{"role": "system", "content": "sys"}]
+    for i in range(10):
+        messages.append({"role": "user", "content": f"u{i}"})
+        messages.append({"role": "assistant", "content": f"a{i}"})
+    # 现在 21 条。紧接着放一对「声明 + 结果」，让 tool 正好落在倒数第 8 条
+    messages.append({
+        "role": "assistant", "content": "",
+        "tool_calls": [{"id": "c1", "type": "function",
+                        "function": {"name": "get_time", "arguments": "{}"}}],
+    })
+    messages.append({"role": "tool", "tool_call_id": "c1", "content": "12:00"})
+    for i in range(7):
+        messages.append({"role": "assistant" if i % 2 == 0 else "user",
+                         "content": f"t{i}"})
+
+    # 切点原本会压在 tool 上
+    assert messages[len(messages) - context.KEEP_RECENT]["role"] == "tool"
+
+    safe = context.keep_from_for(messages)
+    assert messages[safe]["role"] != "tool"
+    # 往前挪一格，正好落在声明它的 assistant 上
+    assert messages[safe].get("tool_calls")
+    assert messages[safe + 1]["role"] == "tool"
 
 
 # ══════════════════════════════════════════════════════════
@@ -46,7 +107,7 @@ def test_compact_result_size(make_history, fake_summarize):
     30 条对话是 31 条 messages → 压完应该只剩 10 条。
     这个数字同时验证了两件事：早期被合并了，保留区没被多留。
     """
-    view = context.compact(make_history(30), fake_summarize)
+    view = context.compact(make_history(30), fake_summarize, budget=FORCE_COMPACT)
     assert len(view) == 1 + 1 + context.KEEP_RECENT
 
 
@@ -56,7 +117,7 @@ def test_summary_message_is_system(make_history, fake_summarize):
     用错 role 的后果很具体：模型会以为自己**说过**摘要里那些话，
     把二手背景当成自己的承诺去执行。
     """
-    view = context.compact(make_history(30), fake_summarize)
+    view = context.compact(make_history(30), fake_summarize, budget=FORCE_COMPACT)
     assert view[0]["role"] == "system"                    # 原 system 保留
     assert view[1]["role"] == "system"                    # 摘要在第 2 位
     assert "摘要" in view[1]["content"]                    # 前缀能区分「二手信息」
@@ -72,7 +133,7 @@ def test_compact_does_not_mutate_original(make_history, fake_summarize):
     history = make_history(30)
     snapshot = [dict(m) for m in history]      # 深一层的浅拷贝，够用（值都是字符串）
 
-    context.compact(history, fake_summarize)
+    context.compact(history, fake_summarize, budget=FORCE_COMPACT)
 
     assert len(history) == 31
     assert history == snapshot
@@ -116,7 +177,7 @@ def test_keeps_the_tail_not_the_head(make_history, fake_summarize):
 
     提示：断言写具体字符串，别写 `assert len(view) > 2`。
     """
-    view = context.compact(make_history(30), fake_summarize)
+    view = context.compact(make_history(30), fake_summarize, budget=FORCE_COMPACT)
 
     # 保留区 = 最后 8 条 = "第22条" … "第29条"
     assert view[2]["content"] == "第22条"
@@ -139,7 +200,7 @@ def test_summarizer_gets_exactly_the_dropped_part(make_history, fake_summarize):
         那条消息要么被**既保留又摘要**（重复计入 token），
         要么被**既没保留也没摘要**（模型直接失忆）。
     """
-    context.compact(make_history(30), fake_summarize)
+    context.compact(make_history(30), fake_summarize, budget=FORCE_COMPACT)
 
     dropped = fake_summarize.calls[0]
     assert len(dropped) == 22

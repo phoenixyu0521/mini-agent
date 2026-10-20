@@ -19,7 +19,7 @@ from contextlib import nullcontext
 from functools import partial
 from typing import Any, Iterator
 
-from agent import context, llm, metrics
+from agent import config, context, llm, metrics
 from agent.memory import Memory
 from agent.session import Session
 from agent.tools import registry
@@ -82,6 +82,19 @@ class AgentLoop:
         # 记录压缩过几次、最近一次省了多少 —— 第 4 周做可观测性时会正式用。
         self.compact_count = 0
         self.last_compact_saving = 0
+
+        # 裁剪预算（token）。惰性算，第一次问的时候才读 config.json。
+        # 为什么不在这里直接读？—— 构造 AgentLoop 不该依赖「配置文件可读」，
+        # 单测里要能凭空造一个实例。
+        self._context_budget: int | None = None
+
+        # 上一次压缩产生的摘要，以及它覆盖到 messages 的哪一条。
+        # 为什么需要缓存？
+        #   压缩判据换成 token 后，可能出现「压完仍然超预算」（保留区里有巨型
+        #   工具结果）。若不缓存，下一轮会**再花一次摘要请求**去压同一段历史，
+        #   每轮都白花一次钱。摘要只依赖被砍掉的那段历史，那段没变就不用重算。
+        self._summary: dict[str, Any] | None = None
+        self._summary_upto = 0
 
         # ── 第 3 周：长期记忆 ────────────────────────────────
         # 它和 session 是两个不同的东西：
@@ -162,6 +175,27 @@ class AgentLoop:
             self._summarizer = llm.make_summarizer()
         return self._summarizer
 
+    def _compaction_budget(self) -> int:
+        """历史消息最多能占多少 token —— 从当前 profile 推导。
+
+        ⚠️ 为什么要 try/except？
+            压缩判断每轮都会调用它。如果这里因为「没有 .env / 配置坏了」抛异常，
+            一句普通对话都会崩 —— 而配置问题应该在**发请求时**报错，
+            不该在「算个数字」的时候把整个循环拦下来。
+
+            降级成默认预算：宁可压得不准，也不能因为算预算而聊不了天。
+        """
+        if self._context_budget is not None:
+            return self._context_budget
+        try:
+            cfg = config.resolve()
+            self._context_budget = context.compact_budget(
+                cfg.context_window, cfg.max_tokens
+            )
+        except Exception:  # noqa: BLE001
+            self._context_budget = context.compact_budget()
+        return self._context_budget
+
     def _view(self) -> list[dict[str, Any]]:
         """返回「本轮要发给模型的视图」——可能比 self.messages 短。
 
@@ -183,29 +217,83 @@ class AgentLoop:
         if not self._should_compact():
             return self._inject_memory(self.messages)
 
+        budget = self._compaction_budget()
         before = context.estimate_tokens(self.messages)
-        try:
-            view = context.compact(self.messages, self._get_summarizer())
-        except Exception as exc:  # noqa: BLE001
-            # 压缩失败不能拖垮对话 —— 退化成「不压缩，原样发」。
-            # 代价是可能撞窗口，但那总比当场崩掉好。
-            # 这是第 2 周 registry.call() 就确立的模式：局部失败不该拖垮全局。
-            print(f"[警告] 上下文压缩失败，本轮降级为全量发送：{exc}")
-            return self._inject_memory(self.messages)
+
+        # 切点要先算出来，它同时是「摘要覆盖到哪」的坐标。
+        # ⚠️ 两个地方必须用同一个函数算：这里和 compact() 内部。
+        #    自己另写一遍 `len - 8` 会绕过「不许切断工具调用对」的对齐逻辑。
+        keep_from = context.keep_from_for(self.messages)
+
+        # 摘要能复用多久？
+        #   _summary_upto 是上次摘要覆盖到的位置。只要之后还没积累够
+        #   KEEP_RECENT 条新历史，复用旧摘要更划算：
+        #   中间这段原样发出去，等攒够一批再花一次摘要请求。
+        #
+        #   为什么不用「_summary_upto == keep_from」这种精确相等？
+        #   因为 keep_from = len(messages) - 8，每聊一轮它就 +2，
+        #   精确相等意味着**每轮都要重新摘要一次**，比不缓存还贵。
+        #   这正好对应原来「8 → 12 留缓冲」的设计意图：压一次撑 1~2 轮。
+        cache_fresh = (
+            self._summary is not None
+            and self._summary_upto <= keep_from
+            and keep_from - self._summary_upto < context.KEEP_RECENT
+        )
+
+        if cache_fresh:
+            view = [
+                self.messages[0],
+                self._summary,
+                *self.messages[self._summary_upto:],
+            ]
+        else:
+            try:
+                view = context.compact(
+                    self.messages, self._get_summarizer(), budget=budget
+                )
+            except Exception as exc:  # noqa: BLE001
+                # 压缩失败不能拖垮对话 —— 退化成「不压缩，原样发」。
+                # 代价是可能撞窗口，但那总比当场崩掉好。
+                # 这是第 2 周 registry.call() 就确立的模式：局部失败不该拖垮全局。
+                print(f"[警告] 上下文压缩失败，本轮降级为全量发送：{exc}")
+                return self._inject_memory(self.messages)
+
+            # 返回的不是原对象 = 真的压了，第二个位置就是摘要消息
+            if view is not self.messages and len(view) > 1:
+                self._summary = view[1]
+                self._summary_upto = keep_from
+                # ⚠️ 计数只在这里 +1（缓存命中不算第二次压缩）。
+                #    否则指标会虚高：连续两轮看同一个摘要，日志会报「压了两次」。
+                self.compact_count += 1
+                after_now = context.estimate_tokens(view)
+                self.last_compact_saving = before - after_now
+                print(
+                    f"[已压缩上下文] {len(self.messages)} 条 → {len(view)} 条，"
+                    f"约省 {self.last_compact_saving} tokens"
+                )
 
         after = context.estimate_tokens(view)
-        if len(view) < len(self.messages):
-            self.compact_count += 1
-            self.last_compact_saving = before - after
+
+        # ⚠️ 压完仍然超预算：说明「保留区自己就太大了」。
+        #    这不是压缩的问题，是某一条消息（通常是工具结果）没有体积上限。
+        #    这里只能明确告警 —— 静默超发会变成「偶尔一个 HTTP 400」，
+        #    那种错最难查，因为它不发生在出错的那一轮。
+        if after > budget:
             print(
-                f"[已压缩上下文] {len(self.messages)} 条 → {len(view)} 条，"
-                f"约省 {self.last_compact_saving} tokens"
+                f"[警告] 压缩后仍约 {after} tokens，超过预算 {budget}；"
+                f"保留区本身过大（单条工具结果未设上限）"
             )
+
         return self._inject_memory(view)
 
     def _should_compact(self) -> bool:
-        """该不该压缩。抽出来是为了让逻辑读起来清楚：先问「要不要压」，再压。"""
-        return self.auto_compact and context.needs_compaction(self.messages)
+        """该不该压缩。抽出来是为了让逻辑读起来清楚：先问「要不要压」，再压。
+
+        判据是 **token 预算**，不是消息条数 —— 见 context.needs_compaction 的注释。
+        """
+        return self.auto_compact and context.needs_compaction(
+            self.messages, self._compaction_budget()
+        )
 
     def _inject_memory(self, view: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """把长期记忆插进视图。
@@ -261,6 +349,9 @@ class AgentLoop:
         # 直接顶替。list 赋值是「换掉整个列表」，不是合并 ——
         # 这正是我们要的：磁盘上的历史就是全部真相，不要和当前内存里的混在一起。
         self.messages = restored
+        # 换了整段历史 → 摘要缓存失效（它对应的是上一份 messages 的切点）
+        self._summary = None
+        self._summary_upto = 0
         # 已经落盘到第几条了。flush_session() 靠它知道该从哪继续写。
         self._flushed = len(restored)
         return True
@@ -496,6 +587,10 @@ class AgentLoop:
         `/resume <id>` 仍然能看到全部历史。
         """
         self.messages = self.messages[:1]
+        # 摘要缓存必须跟着失效 —— 它绑定的是「被砍掉的那段历史」，
+        # 历史都清空了还留着摘要，下次压缩会拼出一条「摘要 + 全新对话」的怪视图。
+        self._summary = None
+        self._summary_upto = 0
 
     # ══════════════════════════════════════════════════════════════════
     #  以下进入第 2 周内容：让模型动手

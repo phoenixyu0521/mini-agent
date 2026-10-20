@@ -5,13 +5,15 @@
       "base_url": "https://maas.qianwenaiapi.com/compatible-mode/v1",
       "model": "deepseek-v4.1-flash",
       "max_tokens": 8192,
-      "timeout": 120
+      "timeout": 120,
+      "context_window": 128000
     },
     "smart": {
       "base_url": "https://maas.qianwenaiapi.com/compatible-mode/v1",
       "model": "deepseek-v4-pro",
       "max_tokens": 8192,
-      "timeout": 180
+      "timeout": 180,
+      "context_window": 128000
     }
   }
 }

@@ -118,6 +118,12 @@ DEFAULT_PROFILE = "fast"
 DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TIMEOUT = 60
 
+# 模型能吃多大的上下文。它决定「历史消息最多占多少 token」——
+# 即 context.compact_budget() 的输入。
+# ⚠️ 这个值必须和模型真实窗口一致：填大了会撞 HTTP 400（窗口不够），
+#    填小了会过早压缩、白丢上下文。换模型时记得一起改。
+DEFAULT_CONTEXT_WINDOW = 128_000
+
 # 内置的默认接口地址和模型。
 # 为什么这两个可以写进代码，而 API Key 不行？
 #     因为它们不是秘密 —— 地址和模型名是公开的。
@@ -142,12 +148,14 @@ TEMPLATE: dict[str, Any] = {
             "model": DEFAULT_MODEL,
             "max_tokens": 8192,
             "timeout": 120,
+            "context_window": DEFAULT_CONTEXT_WINDOW,
         },
         "smart": {
             "base_url": DEFAULT_BASE_URL,
             "model": "deepseek-v4-pro",
             "max_tokens": 8192,
             "timeout": 180,
+            "context_window": DEFAULT_CONTEXT_WINDOW,
         },
     },
 }
@@ -179,6 +187,8 @@ class Config:
         self.model = str(data["model"])
         self.max_tokens = int(data["max_tokens"])
         self.timeout = int(data["timeout"])
+        # 窗口大小：老配置文件没有这一项，兜底成默认值（不该因为缺字段就崩）
+        self.context_window = int(data.get("context_window") or DEFAULT_CONTEXT_WINDOW)
         self.base_url = str(data["base_url"]).rstrip("/")
         self.url = self.base_url + "/chat/completions"
         self.api_key = api_key
@@ -195,6 +205,7 @@ class Config:
         return (
             f"Config(profile={self.profile!r}, model={self.model!r}, "
             f"max_tokens={self.max_tokens}, timeout={self.timeout}, "
+            f"context_window={self.context_window}, "
             f"url={self.url!r}, api_key={masked!r})"
         )
 
@@ -203,7 +214,8 @@ class Config:
         has_key = "已配置" if self.api_key else "缺失"
         return (
             f"配置档案 {self.profile}  |  模型 {self.model}  |  "
-            f"max_tokens {self.max_tokens}  |  超时 {self.timeout}s  |  API Key {has_key}"
+            f"max_tokens {self.max_tokens}  |  超时 {self.timeout}s  |  "
+            f"窗口 {self.context_window // 1000}k  |  API Key {has_key}"
         )
 
 
@@ -338,6 +350,7 @@ def resolve(name: str | None = None) -> Config:
         "model": preset.get("model") or DEFAULT_MODEL,
         "max_tokens": int(preset.get("max_tokens") or DEFAULT_MAX_TOKENS),
         "timeout": int(preset.get("timeout") or DEFAULT_TIMEOUT),
+        "context_window": int(preset.get("context_window") or DEFAULT_CONTEXT_WINDOW),
     }
 
     # d) API Key —— 唯一绝不兜底的一项

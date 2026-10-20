@@ -58,8 +58,13 @@
 
     超过水位线 → 压缩一次 → 掉回水位线以下 → 等下次再涨上来
 
-本项目先做最简单的版本：**按消息条数**算水位线。
-生产环境会按 token 数算（更准），但那需要 tokenizer，第 4 周再说。
+本项目先做最简单的版本：**按 token 预算**算水位线。
+为什么不是按条数？因为条数只是 token 的**代理指标**，两者会严重脱节 ——
+实测过两个极端：11 条消息 10 万 token（条数少、体积大，完全不触发），
+41 条消息 41 token（条数多、体积小，反而触发）。
+
+模型真正受限的东西是 **token 窗口**，所以判据必须用 token。
+估算器见 `estimate_tokens()`，精确的 tokenizer 属于后续优化。
 
 ## 这个文件里不出现的东西
 
@@ -94,16 +99,34 @@ Summarizer = Callable[[list[dict[str, Any]]], str]
 #   而 4 轮足够模型理解「现在在聊什么」。
 KEEP_RECENT = 8
 
-# 超过这个条数就触发压缩。
-# 为什么留出一段间隔（8 → 12）而不是一超就压？
-#   因为压缩本身要花一次模型调用。如果阈值也是 8，那就是「刚压完立刻又超」，
-#   每轮都压，反而更贵。留 4 条缓冲，压一次能撑 1~2 轮。
+# 超过这个预算就触发压缩。
 #
-# 这两个数是**可调参数**，没有标准答案：
-#   对话密度大（每轮很长）→ 调低，省 token 更重要
-#   对话需要长记忆 → 调高，但成本上去了
-# 生产系统会按 **token 数**而不是条数来算水位线，那需要 tokenizer，第 4 周再说。
-COMPACT_AT = 12
+# 2026-10-20 改：判据从「条数」换成「token 预算」。
+#   旧写法 `len(messages) - 1 > 12` 有个致命缺口：
+#   一条 30 万字符的工具结果就能绕过它，直接撞窗口。
+#   实测：5 轮共 10 万 token（11 条）不触发压缩；20 轮共 41 token（41 条）反而触发。
+#
+# 这三个常数是**推导预算**用的，不是拍脑袋的水位线：
+#   预算 = 窗口 - 给输出留的额度 - 安全余量
+# 为什么三项都要减？
+#   - 窗口是「输入 + 输出」共用，不留输出额度，模型会没有空间说话；
+#   - 安全余量吸收估算误差（1 token ≈ 2 字符是经验值，中文会偏）。
+DEFAULT_CONTEXT_WINDOW = 128_000
+DEFAULT_RESERVED_OUTPUT = 8_192
+SAFETY_BUFFER_TOKENS = 2_000
+
+# 兼容旧名字：调用方如果有写死的 COMPACT_AT，语义已经变了，这里保留成预算。
+COMPACT_AT = DEFAULT_CONTEXT_WINDOW - DEFAULT_RESERVED_OUTPUT - SAFETY_BUFFER_TOKENS
+
+
+def compact_budget(
+    context_window: int = DEFAULT_CONTEXT_WINDOW,
+    max_tokens: int = DEFAULT_RESERVED_OUTPUT,
+) -> int:
+    """算出「历史消息最多能占多少 token」。
+    """
+    budget = int(context_window) - int(max_tokens) - SAFETY_BUFFER_TOKENS
+    return max(4_000, budget)
 
 
 def estimate_tokens(messages: list[dict[str, Any]]) -> int:
@@ -115,9 +138,8 @@ def estimate_tokens(messages: list[dict[str, Any]]) -> int:
     经验值（中英混排）：1 个 token ≈ 2 个字符。
     所以字符数 / 2 就是量级上够用的估计。
 
-    这个函数当前只用来**打日志**，不参与裁剪判断（裁剪按条数算）。
-    为什么还留着它？因为你需要一个「感觉」——
-    看着数字涨，你才知道成本在涨。第 4 周做可观测性时会正式用它。
+    这个函数现在**直接参与裁剪判断**（`needs_compaction` 用它）。
+    它还负责打日志 —— 看着数字涨，你才知道成本在涨。
 
     脚手架，已写好。
     """
@@ -134,16 +156,53 @@ def estimate_tokens(messages: list[dict[str, Any]]) -> int:
     return chars // 2
 
 
-def needs_compaction(messages: list[dict[str, Any]], threshold: int = COMPACT_AT) -> bool:
-    """判断要不要压缩。脚手架，已写好。
+def needs_compaction(
+    messages: list[dict[str, Any]],
+    budget: int | None = None,
+) -> bool:
+    """判断要不要压缩 —— **按 token 预算**，不是按条数。
 
-    两个前提必看清：
-        1. messages 的第 0 条是 system —— 它不算在「对话」里，
-           所以要减 1 再看条数。
-        2. 如果系统提示词本身就特别长（比如第 4 周的 AGENTS.md），
-           那减 1 就不够了 —— 但那是以后的问题，现在保持简单。
+    为什么必须用 token？
+        约束模型的是窗口大小（比如 128k token），不是「几条消息」。
+        条数只是它的代理指标，两者会脱节：
+            11 条 × 4 万字符 ≈ 10 万 token  → 旧判据说「不用压」，然后撞窗口
+            41 条 × 2 字符   ≈ 41 token      → 旧判据说「要压」，白花一次摘要钱
+
+    budget=None 时用默认推导值（128k 窗口 / 8k 输出 / 2k 余量）。
+    真实调用应该由入口按当前 profile 传进来 —— 换模型时窗口可能不同。
     """
-    return len(messages) - 1 > threshold
+    if budget is None:
+        budget = compact_budget()
+    return estimate_tokens(messages) > budget
+
+
+def keep_from_for(
+    messages: list[dict[str, Any]],
+    keep_recent: int = KEEP_RECENT,
+) -> int:
+    """算出保留区的起点，**并保证切点不落在工具调用对中间**。
+
+    这是个容易被忽略、但一定会踩的坑：
+
+        assistant(tool_calls=[c1])   ← 声明
+        tool(tool_call_id="c1")      ← 结果
+
+    协议要求这两条必须成对出现。如果切点正好落在它们之间，
+    保留区的第一条就是一条「没有声明者的 tool 消息」，
+    服务商直接报 400（tool_call_id 没有对应的 tool_call）。
+
+    所以切点如果压在 tool 上，就往前挪到它的 assistant 声明之前。
+    代价是保留区多一条，不会出错。
+
+    返回 1 表示「整段都得留，压不了」。
+    """
+    keep_from = len(messages) - keep_recent
+    if keep_from <= 1:
+        return 1
+    # tool 消息永远跟在它的 assistant 声明之后，所以往前挪一步就能配对
+    while keep_from > 1 and messages[keep_from].get("role") == "tool":
+        keep_from -= 1
+    return keep_from
 
 
 # ─────────────────────────────────────────────────────────
@@ -277,11 +336,15 @@ def compact(
     messages: list[dict[str, Any]],
     summarize: Summarizer,
     keep_recent: int = KEEP_RECENT,
+    budget: int | None = None,
 ) -> list[dict[str, Any]]:
-    if not needs_compaction(messages):
+    if not needs_compaction(messages, budget):
         return messages
 
-    keep_from = len(messages) - keep_recent
+    # ⚠️ 不能用 `len(messages) - keep_recent` —— 切点可能落在
+    #    assistant(tool_calls) 和它的 tool 结果之间，那样保留区会以
+    #    一条「没有声明者的 tool 消息」开头，服务商直接 400。
+    keep_from = keep_from_for(messages, keep_recent)
     if keep_from <= 1:
         return messages
 
