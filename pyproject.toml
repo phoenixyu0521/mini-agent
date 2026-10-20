@@ -11,3 +11,16 @@ dependencies = [
     "python-dotenv>=1.2.3",
     "uvicorn[standard]>=0.54.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+# 让 `import agent` 能找到包。等价于在 conftest.py 里 sys.path.insert(0, ".")，
+# 但不用手写、也不依赖你从哪个目录敲 pytest。
+pythonpath = ["."]
+# 只扫 tests/，避免 pytest 把 .venv 里的测试也收集一遍。
+testpaths = ["tests"]
+addopts = "-q"
