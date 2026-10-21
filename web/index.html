@@ -4,15 +4,24 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>mini-agent</title>
+<!-- 空 favicon：不写这行，浏览器每次打开都会请求 /favicon.ico 拿到 404，
+     控制台里永远有一条红色报错。本地工具没必要为此加个图片文件。 -->
+<link rel="icon" href="data:,">
 <style>
 :root{
   --bg:#fff; --panel:#f7f7f8; --border:#e4e4e7; --text:#18181b; --muted:#71717a;
   --user-bg:#2563eb; --user-fg:#fff; --ai-bg:#f2f2f4; --ai-fg:#18181b; --accent:#2563eb;
+  /* 代码配色。用变量而不是直接写死颜色，是因为下面 <style> 要同时支持
+     浅色 / 深色两套 —— 深色模式下同一段代码必须换一套色，否则刺眼或看不清。 */
+  --code-bg:#f6f8fa;
+  --c-key:#cf222e; --c-str:#0a3069; --c-num:#0550ae; --c-com:#6e7781; --c-fn:#8250df;
 }
 @media (prefers-color-scheme:dark){
 :root{
   --bg:#18181b; --panel:#1f1f23; --border:#303036; --text:#e8e8ec; --muted:#8b8b94;
   --user-bg:#2563eb; --user-fg:#fff; --ai-bg:#28282e; --ai-fg:#e8e8ec; --accent:#60a5fa;
+  --code-bg:#161b22;
+  --c-key:#ff7b72; --c-str:#a5d6ff; --c-num:#79c0ff; --c-com:#8b949e; --c-fn:#d2a8ff;
 }}
 *{box-sizing:border-box}
 html,body{height:100%;margin:0}
@@ -51,6 +60,56 @@ header code{font-size:12px;background:var(--ai-bg);padding:1px 6px;border-radius
 .bubble .meta{margin-top:6px;font-size:11px;color:var(--muted);white-space:nowrap}
 .row.user .meta{color:var(--user-fg);opacity:.75}
 .waiting .bubble{color:var(--muted)}
+
+/* ── Markdown 渲染（第 5 周 · 界面第 1 项）─────────────────────────
+   为什么要渲染：模型的回答九成含列表、代码块、表格。不渲染的话你看到的是
+   「一堆原始符号」，读起来像在看源码 —— 这是「不愿打开它」的首要原因。
+
+   white-space 必须放回 normal：.bubble 原来用 pre-wrap 保留换行，那是纯文本的解法；
+   交给 markdown 之后换行由 <p>/<br> 表达，再保留 pre-wrap 会让缩进和空行都留下多余空白，
+   而且 <ul> 的圆点和 <pre> 的缩进会双重叠加。 */
+.bubble.md{white-space:normal}
+.bubble.md>*:first-child{margin-top:0}
+.bubble.md>*:last-child{margin-bottom:0}
+.bubble.md p{margin:.45em 0}
+.bubble.md h1,.bubble.md h2,.bubble.md h3,.bubble.md h4{margin:.9em 0 .4em;line-height:1.35;font-weight:600}
+.bubble.md h1{font-size:1.35em}.bubble.md h2{font-size:1.2em}
+.bubble.md h3{font-size:1.08em}.bubble.md h4{font-size:1em}
+.bubble.md ul,.bubble.md ol{margin:.45em 0;padding-left:1.5em}
+.bubble.md li{margin:.18em 0}
+.bubble.md blockquote{margin:.55em 0;padding:.15em 0 .15em .8em;border-left:3px solid var(--border);color:var(--muted)}
+.bubble.md a{color:var(--accent)}
+.bubble.md hr{border:none;border-top:1px solid var(--border);margin:.9em 0}
+.bubble.md table{border-collapse:collapse;margin:.6em 0;font-size:13px;display:block;overflow-x:auto}
+.bubble.md th,.bubble.md td{border:1px solid var(--border);padding:5px 9px;text-align:left}
+.bubble.md th{background:var(--panel);font-weight:600}
+/* 行内代码和代码块要长得不一样：行内是「一个词」，块是「一段程序」。
+   同一个灰底会让人误读层级。 */
+.bubble.md code{font-family:ui-monospace,Consolas,monospace;font-size:12.5px;
+  background:rgba(127,127,127,.16);padding:1px 5px;border-radius:4px}
+.bubble.md pre{margin:.6em 0;padding:10px 12px;background:var(--code-bg);border:1px solid var(--border);
+  border-radius:8px;overflow-x:auto;line-height:1.5;position:relative}
+.bubble.md pre code{background:none;padding:0;font-size:12.5px;white-space:pre}
+.bubble.md pre .lang{position:absolute;top:6px;right:10px;font-size:10px;color:var(--muted);
+  letter-spacing:.05em;text-transform:uppercase;pointer-events:none}
+
+/* highlight.js 的配色。只覆盖我们用得到的几个语义类，不引它的整份主题 CSS
+   （那份是写死颜色的，浅色/深色要各引一份，还得靠 JS 切）。
+   用变量之后，跟随系统深浅色自动换。 */
+.hljs-comment,.hljs-quote{color:var(--c-com);font-style:italic}
+.hljs-keyword,.hljs-selector-tag,.hljs-literal,.hljs-section{color:var(--c-key)}
+.hljs-string,.hljs-regexp,.hljs-addition,.hljs-attribute{color:var(--c-str)}
+.hljs-number,.hljs-built_in,.hljs-builtin-name,.hljs-selector-attr{color:var(--c-num)}
+.hljs-title,.hljs-title.function_,.hljs-function .hljs-title,.hljs-name,.hljs-tag{color:var(--c-fn)}
+.hljs-attr,.hljs-variable,.hljs-template-variable{color:var(--c-num)}
+.hljs-emphasis{font-style:italic}
+.hljs-strong{font-weight:600}
+
+/* 停止按钮：只在生成中出现。做成「发送」的替代位而不是并排两个按钮，
+   是为了让「现在能做什么」永远只有一个答案。 */
+#stop{display:none;background:#c62828;border-color:#c62828;color:#fff;padding:9px 16px}
+#stop.on{display:inline-block}
+#stop:hover{filter:brightness(1.1);color:#fff}
 
 /* v0.10 第2步：工具事件卡片。
    和 .bubble 长得刻意不一样 —— 它不是「模型说的话」，
@@ -91,14 +150,23 @@ header code{font-size:12px;background:var(--ai-bg);padding:1px 6px;border-radius
   <div class="tools" id="toolBox"></div>
   <div id="inputWrap">
     <textarea id="input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+    <button id="stop" title="中断这一轮。已经生成的内容会保留；但当前这次模型请求可能已经发出，token 已经花了。">停止</button>
     <button id="send">发送</button>
   </div>
 </main>
+
+<!-- 第三方库存本地（web/vendor/），不走 CDN。
+     理由写在 server.py 的 /vendor 挂载那里：本地工具，断网也要能开。 -->
+<script src="/vendor/marked.min.js"></script>
+<script src="/vendor/highlight.min.js"></script>
 
 <script>
 const $ = (id) => document.getElementById(id);
 let sessionId = null;
 let busy = false;
+// 当前这一轮的取消把手。null 表示没有正在跑的请求。
+// 放在模块级而不是 send() 里面，是因为「停止」按钮要能看见它。
+let abortCtrl = null;
 // v0.10 第 2 步之后，两种模式走**同一个端点**（/api/stream），
 //   agentMode = true  → 带上工具说明书，模型可以调工具
 //   agentMode = false → 只聊天，不发工具
@@ -138,12 +206,114 @@ function scrollDown() {
 
 function clearMessages() { $("messages").innerHTML = ""; }
 
+// ══════════════════════════════════════════════════════════
+//  第 5 周 · 界面第 1 项：Markdown 渲染
+//
+//  三件必须处理的事，缺一件这个功能就只是「看起来能用」：
+//
+//  ① 安全：marked 不消毒，`<script>` 会原样输出。
+//     模型的输出是**不可信文本** —— 它可能被提示词注入，也可能只是想
+//     给你看一段 HTML 示例。直接 innerHTML 塞进去，等于在自己浏览器里
+//     执行它写的代码。所以渲染完必须过一遍标签白名单。
+//
+//  ② 流式：字是一个一个来的，中途经常停在半个 ``` 里。
+//     不处理的话，围栏没闭合的那一瞬间整段会先按普通段落渲染（排版乱跳），
+//     闭合后又变回代码块 —— 观感极差。解法是奇数个围栏就临时补一个，
+//     让它先按代码块稳定下来，下一帧自然补齐。
+//
+//  ③ 性能：每个字都重新解析整段 markdown，长回答会卡。
+//     节流到 ~80ms 一次，结束时再补一次终稿。
+// ══════════════════════════════════════════════════════════
+
+// 只放行 markdown 会生成的标签。不在表里的（script / iframe / style …）
+// 会被「拆掉标签、留下文字」—— 内容看得见，但不会被执行。
+//
+// 为什么连 <img> 也不放行（这是测出来才想起来的）：
+//   `![x](http://某个服务器/1.png)` 会**立刻发出一个真实请求**。
+//   那意味着模型的回答能让你在不知情的情况下访问某个地址 ——
+//   对方由此知道你看了这条回答、什么时候看的。这和邮件里的追踪像素是同一件事。
+//   XSS 被我们拦住了，但这个「静默外联」它拦不住，因为不是代码执行。
+//   代价：图片显示成 alt 文字。对一个查资料的工具来说，这个代价可以接受。
+const MD_TAGS = new Set(["P","BR","HR","H1","H2","H3","H4","H5","H6","STRONG","EM","B",
+  "DEL","CODE","PRE","UL","OL","LI","BLOCKQUOTE","A","TABLE","THEAD","TBODY","TR","TH",
+  "TD","SPAN"]);
+
+// 这几个标签要**整块删掉**，不能只剥标签。
+// 只剥标签会把里面的内容变成可见文字 —— 实测把一段 script 标签塞进模型输出，
+// 里面的赋值语句会变成一行裸代码显示在气泡里，看起来像模型写了段乱码。
+// 注意 script 即使不执行也是噪音，所以它属于「删」而不是「留字」。
+const MD_DROP = new Set(["SCRIPT","STYLE","IFRAME","OBJECT","EMBED","SVG","MATH","LINK",
+  "META","BASE","FORM","INPUT","BUTTON","TEXTAREA","SELECT","NOSCRIPT","TEMPLATE"]);
+
+function sanitize(root) {
+  for (const el of root.querySelectorAll("*")) {
+    if (MD_DROP.has(el.tagName)) { el.remove(); continue; }
+    if (!MD_TAGS.has(el.tagName)) { el.replaceWith(...el.childNodes); continue; }
+    for (const attr of [...el.attributes]) {
+      const n = attr.name.toLowerCase();
+      // onerror / onclick / onload —— XSS 最省事的路子，一个都不留
+      if (n.startsWith("on")) { el.removeAttribute(attr.name); continue; }
+      if ((n === "href" || n === "src") &&
+          /^\s*(javascript|data|vbscript):/i.test(attr.value)) {
+        el.removeAttribute(attr.name);
+      }
+    }
+    if (el.tagName === "A" && el.getAttribute("href")) {
+      el.setAttribute("target", "_blank");
+      el.setAttribute("rel", "noopener noreferrer");
+    }
+  }
+  return root;
+}
+
+function mdToFragment(src) {
+  let s = String(src == null ? "" : src);
+  const fences = (s.match(/^[ \t]*```/gm) || []).length;
+  if (fences % 2 === 1) s += "\n```";        // ② 流式时补围栏
+  const tpl = document.createElement("template");
+  tpl.innerHTML = marked.parse(s, { gfm: true, breaks: true });
+  return sanitize(tpl.content);
+}
+
+function setMD(el, text) {
+  el.replaceChildren(mdToFragment(text));
+  if (window.hljs) {
+    el.querySelectorAll("pre code").forEach((b) => {
+      try { hljs.highlightElement(b); } catch (_) { /* 不认识的语言就当纯文本 */ }
+    });
+  }
+  // 代码块右上角标语言 —— 一眼能看出这段是什么，不用读内容去猜
+  el.querySelectorAll("pre").forEach((pre) => {
+    if (pre.querySelector(".lang")) return;
+    const code = pre.querySelector("code");
+    const m = code && code.className.match(/language-([\w+#-]+)/);
+    if (!m) return;
+    const tag = document.createElement("span");
+    tag.className = "lang";
+    tag.textContent = m[1];
+    pre.appendChild(tag);
+  });
+}
+
+// 错误 / 中断这类提示按纯文本显示：它们是「系统说的话」，
+// 里面的方括号和星号不该被当成 markdown 语法解析掉。
+function setPlain(el, text) {
+  el.classList.remove("md");
+  el.textContent = text;
+}
+
 function addBubble(role, text) {
   const row = document.createElement("div");
   row.className = "row " + (role === "user" ? "user" : "ai");
   const b = document.createElement("div");
   b.className = "bubble";
-  b.textContent = text;
+  if (role === "ai") {
+    b.classList.add("md");
+    if (text) setMD(b, text);
+  } else {
+    // 用户输入照样当纯文本 —— 你打的东西不该被当成 markdown 执行
+    b.textContent = text;
+  }
   row.appendChild(b);
   $("messages").appendChild(row);
   scrollDown();
@@ -257,24 +427,55 @@ async function send() {
   let cur = addBubble("ai", "");
   const caret = document.createElement("span");
   caret.className = "caret";
-  cur.appendChild(caret);
+  // ⚠️ 光标放在**气泡外面**（同一个 row 里）。
+  //    setMD 用 replaceChildren 换掉气泡的全部子节点 —— 光标放里面会被一起清掉，
+  //    表现是「打字机光标闪一下就没了」。
+  cur.parentElement.appendChild(caret);
 
   let acc = "";        // 当前这段气泡里已经显示的字
+  let paintTimer = 0;  // 见上面 ③ 节流
+
+  function paint() {
+    if (paintTimer) return;
+    paintTimer = setTimeout(() => { paintTimer = 0; setMD(cur, acc); scrollDown(); }, 80);
+  }
+
+  function flushPaint() {
+    if (paintTimer) { clearTimeout(paintTimer); paintTimer = 0; }
+    setMD(cur, acc);
+    scrollDown();
+  }
 
   // 工具跑完之后，最终答案要**另起一段**。
   // 否则「我来帮你查一下」和真正的答案会挤在同一个气泡里，
   // 读起来像一句话，但其实是模型在两轮请求里说的两段话。
   function nextSegment() {
+    flushPaint();     // 先把上一段落定，否则它可能停在中途的半截 markdown 上
     caret.remove();
+    // 「什么都没说就直接调工具」是很常见的一轮 —— 此时这一段的空气泡要删掉。
+    // 留着它会在界面上出现一个灰色空圆角块，看着像渲染坏了。
+    if (!acc.trim()) cur.remove();
     cur = addBubble("ai", "");
-    cur.appendChild(caret);
+    cur.parentElement.appendChild(caret);
     acc = "";
   }
+
+  // ── 停止按钮的本质：一个 AbortController ──
+  //    fetch 的 signal 一 abort，读流的那一端立刻抛 AbortError，
+  //    浏览器同时断掉连接。服务端那边是同步生成器，Starlette 会在
+  //    下一次 yield 时停止迭代 —— 所以它不会「再也不理这个请求」，
+  //    但**已经发出的那次模型请求仍会跑完**，token 已经花了。
+  //    这也是为什么停止按钮的 title 里写了这句：它省不了这一次的钱，
+  //    它省的是后面还没发的那些轮。
+  const ctrl = new AbortController();
+  abortCtrl = ctrl;
+  $("stop").classList.add("on");
 
   try {
     const resp = await fetch("/api/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: ctrl.signal,
       // use_tools 直接跟随模式。流式端点从第 2 步起已经支持工具了。
       body: JSON.stringify({
         session_id: sessionId,
@@ -306,28 +507,37 @@ async function send() {
         try { obj = JSON.parse(payload); } catch { continue; }
 
         if (obj.error) {
-          cur.textContent = acc + "\n[" + obj.error + "]";
           cur.classList.add("err");
+          setPlain(cur, acc + "\n[" + obj.error + "]");
         } else if (obj.type === "tool") {
           // 一次工具调用 = 一张卡片 + 之后另起一段
           addToolCard(obj);
           nextSegment();
         } else if (obj.text) {
           acc += obj.text;
-          cur.textContent = acc;
-          cur.appendChild(caret);
+          paint();          // 节流渲染，不再每个字都重排
         }
         scrollDown();
       }
     }
   } catch (e) {
     cur.classList.add("err");
-    cur.textContent = acc + "\n[连接失败：" + e.message + "]";
+    if (e.name === "AbortError") {
+      // 中止不是错误，别写「连接失败」——那会让人以为网络出问题了
+      setPlain(cur, (acc ? acc + "\n\n" : "") + "[已停止]");
+    } else {
+      setPlain(cur, acc + "\n[连接失败：" + e.message + "]");
+    }
   }
 
   caret.remove();
+  // 收尾时补一次终稿：节流可能把最后 80ms 以内的字符留在缓冲里没渲染
+  if (paintTimer) { clearTimeout(paintTimer); paintTimer = 0; }
+  if (acc) setMD(cur, acc);
   // 如果最后一段是空的（比如工具跑完模型没再说话），别留一个空气泡
-  if (!acc && !cur.textContent) cur.remove();
+  if (!acc && !cur.textContent.trim()) cur.remove();
+  $("stop").classList.remove("on");
+  abortCtrl = null;
   busy = false;
   $("send").disabled = false;
   input.focus();
@@ -338,6 +548,7 @@ async function send() {
 
 $("send").onclick = send;
 $("newBtn").onclick = newSession;
+$("stop").onclick = () => { if (abortCtrl) abortCtrl.abort(); };
 
 // 模式切换。**Agent 模式才显示工具清单** —— 聊天模式下它们根本不会被发送，
 // 显示出来只会让人以为「它有工具却不用」。

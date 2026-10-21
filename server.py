@@ -33,6 +33,7 @@ from typing import Any, Iterator
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from agent import config as config_mod
@@ -174,6 +175,21 @@ class MemoryRequest(BaseModel):
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(WEB_DIR / "index.html")
+
+
+# 前端用的第三方库（marked / highlight.js）存了本地一份，不走 CDN。
+#
+# 为什么不用 <script src="https://cdn.jsdelivr.net/...">：
+#   ① 这是个**本地工具**，断网也要能打开；
+#   ② 国内访问 jsdelivr 时通时不通，引 CDN 会让「界面白屏」
+#      变成一个随机故障 —— 而且它偏偏在网络好的时候不出现。
+#
+# StaticFiles 自己处理路径穿越（`/vendor/../../.env` 会被拒），
+# 比手写 FileResponse + 字符串拼接安全。
+try:
+    app.mount("/vendor", StaticFiles(directory=WEB_DIR / "vendor"), name="vendor")
+except RuntimeError:  # 目录不存在（比如只 clone 了部分文件）时不要让服务起不来
+    pass
 
 
 @app.get("/api/info")
