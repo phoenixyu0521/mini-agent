@@ -199,3 +199,70 @@ def test_unknown_section_returns_friendly_error(docs):
     text = docs.call_tool("get_section", {"section_id": 987654})
     assert "没有 id=" in text
     assert not text.startswith("[错误]")   # 是「查不到」，不是「工具坏了」
+
+
+# ══════════════════════════════════════════════════════════
+#  外部客户端兼容性（Cursor 红点事故的回归测试）
+# ══════════════════════════════════════════════════════════
+
+def test_starting_from_wrong_cwd_still_works():
+    """`python -m mcp_servers` 换个工作目录就 `No module named`。
+
+    这正是 Cursor 报「MCP error -32000: Connection closed」的原因：
+    它 spawn 子进程时不认配置里的 cwd，进程 import 失败直接退出，
+    而客户端不会把子进程的 stderr 给你看。
+
+    launch.py 自己算路径，所以从任意目录启动都必须成功。
+    这里故意用系统临时目录当 cwd —— 它不可能是项目目录。
+    """
+    import subprocess
+    import tempfile
+
+    launch = os.path.join(PROJ, "mcp_servers", "launch.py")
+    assert os.path.exists(launch), "launch.py 是外部客户端的入口，不能删"
+
+    msg = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}\n'
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = subprocess.run(
+            [sys.executable, launch],
+            input=msg,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=tmp,                      # ← 关键：不是项目目录
+            timeout=60,
+        )
+    assert proc.returncode == 0, f"从 {tmp} 启动失败，stderr={proc.stderr[:400]}"
+    import json as _json
+    reply = _json.loads(proc.stdout.strip().splitlines()[0])
+    assert reply["result"]["serverInfo"]["name"] == "hello-agents-docs"
+
+
+def test_protocol_version_is_negotiated():
+    """客户端要的版本我们支持就回它要的，不能硬回老版本。
+
+    新版客户端（Cursor 3.x）发 2025-06-18。硬回 2024-11-05 可能被判为不兼容，
+    客户端报的还是「Connection closed」，查起来和启动失败长得一模一样。
+    """
+    from mcp_servers.protocol import PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS
+
+    server = MCPServer(name="t", version="0", tools=[])
+
+    for ver in SUPPORTED_PROTOCOL_VERSIONS:
+        reply = server.handle({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": ver},
+        })
+        assert reply["result"]["protocolVersion"] == ver
+
+    # 不认识的版本 → 回自己的默认值，让客户端自己决定（规范允许）
+    reply = server.handle({
+        "jsonrpc": "2.0", "id": 2, "method": "initialize",
+        "params": {"protocolVersion": "2019-01-01"},
+    })
+    assert reply["result"]["protocolVersion"] == PROTOCOL_VERSION
+
+    # 客户端没发版本（老客户端）→ 也不能崩
+    reply = server.handle({"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": {}})
+    assert reply["result"]["protocolVersion"] == PROTOCOL_VERSION
+

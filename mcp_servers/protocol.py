@@ -44,6 +44,16 @@ from typing import Any, Callable
 
 PROTOCOL_VERSION = "2024-11-05"
 
+# 我们能兼容的协议版本。这几个版本之间，initialize / tools/list / tools/call
+# 的形状没有变化（新增的是 structuredContent、elicitation 等我们不用到的能力），
+# 所以可以实现「客户端要哪个就回哪个」。
+#
+# 为什么要协商，而不是固定回 2024-11-05：
+# 规范说服务器回自己的版本，客户端若不支持就断开。新版客户端（Cursor 3.x）
+# 发的是 2025-06-18，硬回一个它不认识的老版本，可能直接被判为不兼容 → 连接关闭。
+# 而客户端报出来的错是「Connection closed」，看不出是版本问题。
+SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
+
 
 @dataclass
 class ToolSpec:
@@ -108,8 +118,15 @@ class MCPServer:
 
         try:
             if method == "initialize":
+                params = message.get("params") or {}
+                wanted = str(params.get("protocolVersion") or "")
+                # 客户端要的版本我们支持 → 回它要的；不认识 → 回自己的默认值，
+                # 让客户端自己决定兼不兼容（这是规范允许的做法）。
+                agreed = wanted if wanted in SUPPORTED_PROTOCOL_VERSIONS else PROTOCOL_VERSION
+                if wanted and agreed != wanted:
+                    log(f"客户端请求协议 {wanted}，我们回退到 {agreed}")
                 return self._ok(msg_id, {
-                    "protocolVersion": PROTOCOL_VERSION,
+                    "protocolVersion": agreed,
                     "capabilities": {"tools": {"listChanged": False}},
                     "serverInfo": {"name": self.name, "version": self.version},
                 })
