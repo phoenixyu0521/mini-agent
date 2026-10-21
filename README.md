@@ -1,9 +1,22 @@
 # mini-agent
 
-从零手写的 Agent 内核 —— 5 周学习项目的代码仓库。
+**从零实现的 Agent 内核 —— 不使用任何 Agent 框架。**
 
-没有 LangChain、没有框架封装：`messages` 列表、`while` 循环、工具协议、
-MCP client / server、skill 全部手写。**每处设计决策都写了「为什么」和实测数字。**
+`messages` 循环、工具协议、MCP client / server、skill 系统全部手写。
+不是某个框架的封装层，是内核本身。
+
+| | |
+|---|---|
+| 内核规模 | 4,500 行（含测试 8,400 行） |
+| 测试 | 107 条，含**变异测试**（故意改坏实现，验证断言不是空转） |
+| 互操作 | 自建 MCP server 已被 **Cursor** 作为第三方客户端验证通过 |
+| 许可 | MIT |
+
+每一处设计决策都写了「为什么」和实测数字 —— 包括**被实测推翻的那些**：
+最初认为「接私有数据才有价值」，A/B 实验证明关掉工具模型仍能答对 4/4，
+于是判据改成了「模型会不会编造」。
+
+## 五周，五个结论
 
 | 周 | 主题 | 最重要的结论 |
 |---|---|---|
@@ -27,6 +40,9 @@ mini-agent/
 ├── .env.example        # 配置模板（进 Git）
 ├── .env                # 你的真实 Key（不进 Git，需自己从模板复制）
 ├── stage0_check.py     # 【阶段 0 交付物】调通一次模型接口
+├── start.bat           # 双击启动（纯 ASCII，见「一键启动」）
+├── launcher.py         # 启动器的中文界面 / 端口轮询 / 开浏览器
+├── LICENSE             # MIT
 ├── agent/
 │   ├── __init__.py
 │   ├── llm.py          # 模型调用封装 —— 唯一与厂商耦合的文件
@@ -37,6 +53,9 @@ mini-agent/
 │   ├── config.py       # 【第 3 周】配置化（把「凭据」与「配置」分开）
 │   ├── metrics.py      # 【第 4 周】三段耗时 + token + 错误
 │   ├── skills.py       # 【第 5 周】skill 两层渐进披露
+│   ├── channels/       # 【第 6 周】渠道层：把「消息从哪来」与内核分开
+│   │   ├── __init__.py #   Inbound（含幂等键）+ session_id_for()
+│   │   └── wechat.py   #   公众号验签 / XML 解析 / 被动回复（不接个人号）
 │   ├── mcp/            # 【第 4 周扩展】手写的 MCP client
 │   │   ├── protocol.py #   子进程 + 一行一条 JSON + 队列超时
 │   │   ├── client.py   #   握手 / tools/list / tools/call
@@ -1087,10 +1106,23 @@ token 已经算进账单。它省的是后面还没发的那些轮 —— 工具
   - [x] 没 `.venv` 自动 `uv sync`；端口已占只开浏览器；没 `.env` 只警告不拦
   - [x] 轮询端口再开浏览器（不用固定 sleep，机器慢也不会白屏）
   - [x] `.gitattributes` 加 `*.bat text eol=crlf`（cmd 对 LF-only 的 bat 不可靠）
-- [x] **`pytest` 全绿：88 passed**
+- [x] **第 6 周起步 · 渠道层 + 微信公众号协议**（`da254e3`）
+  - [x] `agent/channels/`：`Inbound`（含幂等键 `msg_id`）+ `session_id_for()`
+  - [x] 微信公众号：验签 / XML 解析 / 被动回复构造（**不接个人号** —— 无官方 API）
+  - [x] 会话 id 从「时间戳」改成「渠道+用户」的稳定哈希（IM 里时间戳会撞名且会失忆）
+  - [x] 19 条协议测试（验签 5 / 解析 6 / 回复 5 / 会话身份 3）
+- [x] **`pytest` 全绿：107 passed**
 - [ ] **已知局限（诚实清单）**
   - [ ] wheel 里**不含** `web/`（`index.html` 与 `vendor/`）—— 只影响 `pip install` 分发，`uv run` 不受影响
   - [ ] HTTP 层**零鉴权** —— 只能在本机用，不能直接暴露到公网
   - [ ] `_agents` 会话池没有 TTL，长期跑会一直占内存
   - [ ] 撞上 `max_iterations` 时，工具结果在 `messages` 里但用户拿不到 —— 正确做法是再发一次不带 `tools` 的请求收尾
   - [ ] 停止按钮**省不了已经发出的那次请求**的钱（中止发生在两个 chunk 之间）
+
+## 许可
+
+MIT，见 [`LICENSE`](LICENSE)。
+
+选它的理由很实际：这是给**别人**用的前提。没有许可证的仓库，公司的法务不允许引用 ——
+哪怕代码本身再好。想让这个项目进入任何真实的协作场景，这一步是必须的。
+
