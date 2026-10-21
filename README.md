@@ -702,25 +702,63 @@ RemoteTool(远端工具)  →  伪装成本地 Tool  →  registry 里和 get_ti
 工具描述里还写了「查询用具体技术词，不要用整句问句」——
 这是在**教模型怎么用工具**，属于工具设计的一部分，不是废话。
 
-### 给 Cursor / Claude Desktop 配
+### 给 Cursor / Claude Desktop 配（含一个「看起来像协议错、其实是启动错」的坑）
 
-`config.json` 里的 `mcpServers` 是**同一个格式**，可以直接抄：
+配置文件放 `<用户目录>/.cursor/mcp.json`（全局，对所有项目生效）：
 
 ```json
 {
   "mcpServers": {
     "helloagents": {
       "command": "D:\\WorkBuddy\\nanobot\\mini-agent\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "mcp_servers"],
-      "cwd": "D:\\WorkBuddy\\nanobot\\mini-agent",
-      "enabledTools": ["list_chapters", "search_docs", "get_section", "get_outline"]
+      "args": ["D:\\WorkBuddy\\nanobot\\mini-agent\\mcp_servers\\launch.py"]
     }
   }
 }
 ```
 
-> `command` 用 `.venv` 里的 python 绝对路径，不要用 `uv run` ——
-> 客户端 spawn 子进程时没有「当前目录」这个概念，相对路径会扑空。
+**就这两行，没有 `cwd`，没有 `env`。** 这是踩坑之后简化出来的。
+
+#### 踩过的坑：`MCP error -32000: Connection closed`
+
+第一次配的时候写的是 `args: ["-m", "mcp_servers"]` + `"cwd": "<项目目录>"`，
+自己测全通，Cursor 里却是红点。查出来是这个原因：
+
+| 启动方式（实测四组） | 结果 |
+|---|---|
+| cwd=项目 + 设 `PYTHONPATH` | ✅ |
+| cwd=项目，不设 `PYTHONPATH` | ✅ |
+| **cwd=别的目录，不设 `PYTHONPATH`** | ❌ `No module named mcp_servers`，退出码 1 |
+| `uv run --directory <项目>` | ✅ |
+
+**Cursor 3.24 不认配置里的 `cwd` 字段。** 于是子进程从别处启动，import 就失败，
+进程退出 → 客户端只说一句「连接已关闭」。
+
+> 这件事最值得记的不是修法，是**误导性**：
+> 客户端**不会把子进程的 stderr 显示给你**。「进程没起来」和「协议不兼容」
+> 报的是同一个错。你如果第一反应去改协议版本，会一路改错方向。
+
+所以 `mcp_servers/launch.py` 自己算项目路径、自己插 `sys.path`，
+**不依赖客户端给的工作目录，也不依赖环境变量**。任何 cwd 都能起来。
+
+顺带修的第二个坑：`initialize` 原来硬回 `2024-11-05`，而 Cursor 3.x 发的是
+`2025-06-18`。规范说服务器回自己的版本、客户端不支持就断开 ——
+**断开的报错同样是「Connection closed」**，和上面那个长得一模一样。
+现在改成客户端要哪个就回哪个（限已知的三个版本），不认识才回退默认值。
+
+#### 验收：Cursor 真能调用
+
+不只是绿灯。在 Cursor 的 Agent 模式里问「用 helloagents 查一下，MCP 的传输方式有哪几种」：
+
+![Cursor 调用 helloagents 的实拍](docs/cursor-mcp-verified.png)
+
+它自己走完了 `search_docs → get_section`，答案带章节号（10.2.3）、
+五种传输方式（Memory / Stdio / HTTP / SSE / StreamableHTTP）与原文一致。
+
+**这一步为什么必须做**：自己的 client 连自己的 server，两端可以互相迁就 ——
+client 对不规范的字段过度宽容、server 漏发规范要求的字段但 client 不检查，
+照样「测试通过」。Cursor 是别人写的、严格按规范解析，它连通才算数。
+
 
 ## 第 5 周 · skill 系统：说明书，不是能力
 
