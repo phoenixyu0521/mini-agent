@@ -7,6 +7,13 @@
 # 规则：仓库里一律存 LF；检出时也保持 LF（现代编辑器都认）。
 * text=auto eol=lf
 
+# 例外：Windows 批处理**必须**是 CRLF。
+# cmd.exe 对 LF-only 的 .bat 在 goto / if 块 / 标签跳转上不可靠，
+# 表现是「有的行执行了，有的行被当成命令名」—— 极难查。
+# 这条规则必须写在 * 之后才生效（gitattributes 后者优先）。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
 # 二进制文件不做任何转换（转换会直接损坏文件）
 *.png binary
 *.jpg binary

@@ -95,6 +95,58 @@ uv run mini-agent-server
 > 命令是从 `[project.scripts]` 来的，等价于 `uv run python server.py`。
 > 好处是换机器不用记「哪个文件是入口」。
 
+### 不想每次敲命令：双击 `start.bat`
+
+Windows 上双击项目根目录的 **`start.bat`** 就行（桌面快捷方式指向它）：
+
+```
+双击 → 没环境就自动 uv sync → 起服务 → 端口一通就自动开浏览器
+关掉那个黑窗口 = 停止服务
+```
+
+它做了三件「不然会让人放弃」的事：
+
+| 情况 | 行为 |
+|---|---|
+| 第一次运行，没有 `.venv` | 自动 `uv sync`（前提是装了 uv；没装会给出安装地址） |
+| 8000 端口已经被占（上次那个窗口还开着） | 不再起第二个，只打开浏览器 |
+| 没有 `.env` | **不阻止启动** —— 界面和历史会话照常，只是发消息会报缺 Key |
+
+> 为什么「没 .env 也让你进」：直接拦住的话，用户看到的是一个闪退的窗口，
+> 而真正的原因（缺 Key）他看不见。放进去再在发消息时报错，问题才是可定位的。
+
+**这个脚本是可以给别人用的。** 全部路径都从 `%~dp0`（脚本自己所在目录）推出来，
+没有一处写死 `D:\WorkBuddy\...`。把整个文件夹拷给别人 → 双击 `start.bat` → 装上 uv 就能跑。
+
+#### 一个必须记住的坑：`.bat` 里不能写 UTF-8 中文
+
+第一版我把中文提示全写进了 `start.bat`，结果是：
+
+```
+'─────' 不是内部或外部命令
+'env.example' 不是内部或外部命令
+'o.' 不是内部或外部命令
+```
+
+不是「中文变乱码」这么温和——**整行命令都被撑坏了**。
+因为 cmd.exe 是**按字节**解析 `.bat` 的，它用当前代码页（中文 Windows 是 GBK/936）读文件，
+UTF-8 的多字节序列里含有被 cmd 当成控制符的字节，一行被切成好几段。
+
+（`chcp 65001` 救不了：它在**第二行才执行**，而解析早就开始了。）
+
+所以现在的分工是：
+
+- **`start.bat` 纯 ASCII** —— 只做「判断环境 / 拉起 Python」
+- **`launcher.py`** —— 所有面向人的中文输出、端口检查、开浏览器
+
+顺带一条：`.gitattributes` 里 `* text=auto eol=lf` 会把 `.bat` 也变成 LF，
+而 **cmd 对 LF-only 的 `.bat` 在 `goto` / 标签跳转上不可靠**。所以加了两行例外：
+
+```gitattributes
+*.bat text eol=crlf
+*.cmd text eol=crlf
+```
+
 **换机器会踩的两个坑（都在 `config.json` 里）：**
 
 1. `base_url` 必须和你的 Key 是**同一家厂商**。不匹配会报 401「令牌已过期」——
@@ -1030,6 +1082,11 @@ token 已经算进账单。它省的是后面还没发的那些轮 —— 工具
   - [x] `#stop` —— AbortController；显示 `[已停止]`，保留已生成内容
   - [x] `web/vendor/` 由 `server.py` 的 `/vendor` 挂载（`StaticFiles` 自带路径穿越防护）
   - [x] 真浏览器验证：系统 Edge + playwright-core，渲染 / 消毒 / 工具卡片 / 停止四项全过
+- [x] **一键启动**：`start.bat`（纯 ASCII）+ `launcher.py`
+  - [x] 路径全部从 `%~dp0` 推出，文件夹可搬运 / 可拷给别人
+  - [x] 没 `.venv` 自动 `uv sync`；端口已占只开浏览器；没 `.env` 只警告不拦
+  - [x] 轮询端口再开浏览器（不用固定 sleep，机器慢也不会白屏）
+  - [x] `.gitattributes` 加 `*.bat text eol=crlf`（cmd 对 LF-only 的 bat 不可靠）
 - [x] **`pytest` 全绿：88 passed**
 - [ ] **已知局限（诚实清单）**
   - [ ] wheel 里**不含** `web/`（`index.html` 与 `vendor/`）—— 只影响 `pip install` 分发，`uv run` 不受影响
