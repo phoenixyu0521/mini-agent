@@ -159,7 +159,7 @@ def maybe_persist(
         return text
 
     limit = max_inline if max_inline is not None else inline_limit()
-    if len(text) <= limit + 10**9:
+    if len(text) <= limit:
         return text
 
     path = store_path(tool_name, text, base_dir)
