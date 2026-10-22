@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
@@ -28,6 +29,7 @@ import httpx
 from dotenv import load_dotenv
 
 from agent import config as _config
+from agent import retry
 
 load_dotenv()
 
@@ -270,6 +272,22 @@ def _headers(cfg: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def _retry_after_seconds(resp: httpx.Response) -> float | None:
+    """读 `Retry-After` 头（限流时对方会告诉我们等多久）。
+
+    只支持秒数格式（"5"）。HTTP 日期格式（"Wed, 21 Oct 2015 07:28:00 GMT"）
+    在 API 限流里基本见不到，解析它要引 email.utils，收益不成比例。
+    读不懂就返回 None，退回自己的指数退避 —— **不要为了一个头崩掉**。
+    """
+    raw = resp.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw.strip()))
+    except (TypeError, ValueError):
+        return None
+
+
 def _payload(
     cfg: dict[str, Any],
     messages: list[dict[str, Any]],
@@ -304,14 +322,31 @@ def chat(
         模型有需要时会返回 tool_calls 而不是正文。
     """
     cfg = cfg or load_config()
-    resp = get_client().post(
-        cfg["url"],
-        headers=_headers(cfg),
-        json=_payload(cfg, messages, stream=False, tools=tools),
-        timeout=cfg["timeout"],
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"请求失败 HTTP {resp.status_code}\n{resp.text}")
+
+    # ── 第 6 周：把「发一次」变成「发，抖了就再发」 ──
+    #
+    # 为什么把 raise 写在 _once 里面，而不是外面？
+    #   因为重试要知道**这一次**是 503 还是 401。
+    #   如果先返回 response、出来再判，那 with_retry 看到的永远是「成功」，
+    #   一次都不会重试 —— 这类错误很容易写出来，而且测试只测「最终抛错」时
+    #   根本发现不了（它确实抛错了，只是没重试）。
+    def _once() -> httpx.Response:
+        response = get_client().post(
+            cfg["url"],
+            headers=_headers(cfg),
+            json=_payload(cfg, messages, stream=False, tools=tools),
+            timeout=cfg["timeout"],
+        )
+        if response.status_code != 200:
+            raise retry.APIError(
+                status=response.status_code,
+                body=response.text,
+                retry_after=_retry_after_seconds(response),
+                url=cfg["url"],
+            )
+        return response
+
+    resp = retry.with_retry(_once, on_retry=retry.print_notice)
 
     data = resp.json()
     message = data["choices"][0]["message"]
@@ -342,11 +377,11 @@ def chat(
     )
 
 
-def stream_chat(
+def _stream_once(
     messages: list[dict[str, Any]],
-    cfg: dict[str, Any] | None = None,
-    tools: list[dict[str, Any]] | None = None,
-    outcome: StreamOutcome | None = None,
+    cfg: dict[str, Any],
+    tools: list[dict[str, Any]] | None,
+    outcome: StreamOutcome | None,
 ) -> Iterator[str]:
     """一小段一小段地拿回复。
 
@@ -384,7 +419,12 @@ def stream_chat(
     ) as resp:
         if resp.status_code != 200:
             resp.read()
-            raise RuntimeError(f"请求失败 HTTP {resp.status_code}\n{resp.text}")
+            raise retry.APIError(
+                status=resp.status_code,
+                body=resp.text,
+                retry_after=_retry_after_seconds(resp),
+                url=cfg["url"],
+            )
 
         # ─────────────────────────────────────────────────────────
         # 这里要盯两个量，因为**流式下的失败模式是静默的**。
@@ -543,6 +583,56 @@ def stream_chat(
                 f"（思考了 {reasoning_chars} 字）\n"
                 "常见原因：max_tokens 太小，或上游返回了空响应。"
             )
+
+
+def stream_chat(
+    messages: list[dict[str, Any]],
+    cfg: dict[str, Any] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    outcome: StreamOutcome | None = None,
+) -> Iterator[str]:
+    """流式拿回复 —— 在 `_stream_once` 外面加了一层「还没开口就能重试」。
+
+    ⭐ 规则只有一条：**一旦已经吐出过字符，就不再重试。**
+
+       为什么？因为调用方（终端 / Web）已经把那些字显示出来了。
+       重试会让它们再来一遍 —— 用户看到「现在」变成「现在现在」。
+       屏幕上多俩字还是次要的，更糟的是前端按片段追加，
+       重试后同一段内容出现两次，用户会以为模型坏了。
+
+       所以重试窗口只有「建连 → 拿到响应头 → 第一帧之前」这一段。
+       实践中这也是绝大多数失败发生的位置（503、连接超时、握手失败）。
+       真在流到一半断掉，正确做法是**把已收到的给用户 + 明确报错**，
+       而不是假装重来 —— 那会丢掉用户已经看到的那半句。
+
+    outcome 的生命周期：
+       重试时 `_stream_once` 会往**同一个** outcome 里重写字段。这是安全的，
+       因为上一次尝试在吐出任何字符之前就失败了，它还没来得及写 tool_calls；
+       而分片收件箱 `partial` 是 `_stream_once` 的局部变量，每次尝试都是新的。
+
+    ⚠️ 一个容易写错的细节：
+       `yielded` 必须在**第一次 yield 之后**就为真。写成「先判断再 yield」
+       或者用「yield 个数」在外部统计，都会漏掉「已吐出但仍重试」这种情形 ——
+       而那正是会让用户看到重复文字的那种 bug。
+    """
+    cfg = cfg or load_config()
+    policy = retry.policy_from_env()
+
+    attempt = 0
+    while True:
+        attempt += 1
+        yielded = False
+        try:
+            for piece in _stream_once(messages, cfg, tools, outcome):
+                yielded = True
+                yield piece
+            return
+        except Exception as exc:  # noqa: BLE001 —— 交给 is_retryable 分类
+            if yielded or attempt >= policy.attempts or not retry.is_retryable(exc):
+                raise
+            delay = policy.delay_for(attempt, retry.retry_after_of(exc))
+            retry.print_notice(attempt, exc, delay)
+            time.sleep(delay)
 
 
 def format_usage(usage: dict[str, Any] | None) -> str:
