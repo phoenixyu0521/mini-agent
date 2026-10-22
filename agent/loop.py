@@ -27,6 +27,17 @@ from agent.tools import registry
 
 DEFAULT_SYSTEM = "你是简洁的中文助手，回答不超过三句话。"
 
+# 撞上工具轮上限后，第二次收尾请求会带上这一句。
+#
+# 为什么需要它？——因为「不传 tools」**并没有**让模型停止请求工具（实测）。
+# 它只是让那些请求无法被执行。所以还要用一句话把那条路明确堵上。
+# 注意：它只加在**这一次请求的视图副本**里，不进 self.messages ——
+# 否则下一轮模型会把它当成「用户说过的话」。
+NO_TOOLS_NUDGE = (
+    "（系统提示：工具调用额度已经用完，请不要再请求任何工具，"
+    "直接根据上面已经拿到的工具结果回答用户。）"
+)
+
 
 class AgentLoop:
     """一次会话。self.messages 就是这次会话的全部「记忆」。"""
@@ -902,5 +913,115 @@ class AgentLoop:
         # 走到这里说明模型停不下来：要么一直在调工具，要么工具给的结果它一直不满意。
         # 这就是 ROADMAP 里「为什么必须有 max_iterations」那个问题的答案 ——
         # 没有刹车，它会一直调，而每次调用都是两次请求，**一直在烧钱**。
+        #
+        # ⚠️ 以前这里只返回一句固定文案。问题很具体：
+        #    messages 里已经躺着 5 条工具结果 —— 活干完了、答案没交付。
+        #    用户看到「已达到最大工具调用轮数」，而那 5 条结果他一个字都看不到。
+        #    这是最亏的一种失败：钱花了，信息也拿到了，只是没说出口。
         # ─────────────────────────────────────────────────────────
-        sink["text"] = f"已达到最大工具调用轮数（{max_iterations}），我先停在这里。"
+        sink["text"] = self._final_answer_without_tools(max_iterations, reply)
+
+    def _final_answer_without_tools(
+        self, max_iterations: int, pending: llm.Reply | None = None
+    ) -> str:
+        """撞上上限时的收尾：**不带工具**再要一次回答。
+
+        ⚠️⚠️ 实测推翻了我的假设（2026-10-22）：
+            我以为「请求里不传 tools，它就只能说话」。
+            **不成立。** 历史里已经有 tool_calls / tool 结果，
+            模型会照着这个模式继续往下写 —— 实测不带 tools 的一次请求，
+            它照样吐了 4 个 `read_file` 调用（只是它们不会被执行）。
+            所以「不给工具」只是必要条件，不是充分条件。
+
+        于是在它上面加了两层兜底，一共三级：
+
+            1. 不带 tools 请求一次 → 有正文就用（**哪怕它同时吐了 tool_calls**：
+               正文是它自己写的答案，那些调用我们直接丢弃、不存历史）
+            2. 正文也是空的 → 加一句「不要再请求工具」再问一次
+            3. 还是空的 → 把已经执行过的工具结果直接摊给用户
+
+        第 3 级为什么不是「返回一句固定文案」？
+            用户在这一轮里已经付了 3~6 次模型调用的钱，手上握着真实的工具结果。
+            告诉他「模型没有给出总结」等于让他空手而归。
+            宁可难看一点，也要把信息交出去 —— 这是 fail-closed 的对偶：
+            **失败时给次优结果，不给空结果。**
+
+        为什么失败要退回文案、而不是往外抛？
+            收尾是**补救措施**。补救本身失败，不该把前面跑出来的
+            若干条工具结果一起葬掉 —— 那等于二次伤害。
+        """
+        suffix = (
+            f"\n\n（说明：工具已连续调用 {max_iterations} 轮，达到上限，"
+            f"以上是提前收尾的总结。）"
+        )
+
+        # ── 第 0 级：循环结束时手里还攥着一条回复 ──
+        # 如果它已经不要求调工具、而且有正文，那就是答案，别再花钱问一遍。
+        # （这条是写测试时数请求次数才发现的：旧代码会把这条正文丢掉再问一次。）
+        if pending is not None and not pending.wants_tools:
+            text = (pending.text or "").strip()
+            if text:
+                self.messages.append(pending.to_message())
+                self.last_usage = pending.usage
+                self.flush_session()
+                return text + suffix
+
+        # ── 第 1、2 级：请求一次，空了就加一句劝告再请求一次 ──
+        for attempt in (1, 2):
+            try:
+                view = self._view()
+                if attempt == 2:
+                    # ⚠️ 只加在**这次请求的视图副本**里，不进 self.messages。
+                    #    它是「临时劝告」，不是对话的一部分 ——
+                    #    存进历史，下一轮模型会把它当成用户说过的话。
+                    view = view + [{"role": "user", "content": NO_TOOLS_NUDGE}]
+                with self.meter.phase("model") if self.meter else nullcontext():
+                    # 注意：这里**没有** tools 参数。
+                    reply = llm.chat(view)
+                if self.meter is not None:
+                    self.meter.count_request(reply.usage)
+                text = (reply.text or "").strip()
+            except Exception as exc:  # noqa: BLE001
+                return (
+                    f"已达到最大工具调用轮数（{max_iterations}），"
+                    f"补一次总结时又失败了（{type(exc).__name__}: {exc}），我先停在这里。"
+                )
+
+            if text:
+                # 只存 content，**不带 tool_calls**。
+                # 为什么不用 reply.to_message()？
+                #   收尾请求里它仍然可能吐 tool_calls（实测）。
+                #   存进去就是一条「声明了调用、却永远等不到结果」的消息，
+                #   下一轮请求会因为 tool_call_id 配不上直接 400 ——
+                #   雷埋在历史里，要到下一次对话才炸。
+                self.messages.append({"role": "assistant", "content": text})
+                self.last_usage = reply.usage
+                self.flush_session()
+                return text + suffix
+
+        # ── 第 3 级：两次都是空正文，直接把工具结果摊出来 ──
+        return self._tool_results_digest(max_iterations)
+
+    def _tool_results_digest(self, max_iterations: int, limit: int = 3) -> str:
+        """兜底：把最后几条工具结果直接交给用户。
+
+        为什么取「最后几条」而不是全部？
+            最后几条最接近用户此刻想知道的东西；而且这一轮的
+            工具结果可能很多，全摊出来会把终端刷满。
+        """
+        lines: list[str] = []
+        for message in reversed(self.messages):
+            if message.get("role") != "tool":
+                continue
+            body = " ".join(str(message.get("content") or "").split())
+            if body:
+                lines.append(body[:400])
+            if len(lines) >= limit:
+                break
+        lines.reverse()
+
+        head = f"已达到最大工具调用轮数（{max_iterations}），模型没能给出总结。"
+        if not lines:
+            return head + "这一轮也没有可展示的工具结果，请换个问法或缩小范围。"
+        body = "\n".join(f"- {line}" for line in lines)
+        return f"{head}以下是最后 {len(lines)} 次工具的结果：\n{body}"
