@@ -92,6 +92,20 @@ def test_exactly_at_limit_passes_through(tmp_path: Path) -> None:
     assert not store.exists()
 
 
+def test_tiny_limit_does_not_make_it_worse(tmp_path: Path) -> None:
+    """阈值调得很小时，落盘不能变成负优化。
+
+    这是真机跑出来的教训：阈值设 600、结果 3639 字符，
+    预览却是 1500+1500=3000 字符 —— 只省 639，还多一个文件。
+    判据从「超没超阈值」补成「落盘之后是不是真的更短」。
+    """
+    text = "z" * 1000      # 比 limit 大，但比「头 + 尾」小
+    store = tmp_path / "store"
+    out = tool_results.maybe_persist("big_tool", text, base_dir=store, max_inline=600)
+    assert out == text
+    assert not store.exists()
+
+
 def test_same_content_writes_once(tmp_path: Path) -> None:
     """同内容 → 同文件名，写两次只有一个文件。
 

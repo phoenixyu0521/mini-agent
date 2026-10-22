@@ -159,7 +159,14 @@ def maybe_persist(
         return text
 
     limit = max_inline if max_inline is not None else inline_limit()
-    if len(text) <= limit:
+    # 第二个条件是 2026-10-22 真机跑出来的：
+    #   把阈值临时调到 600，一个 3639 字符的结果被落盘，
+    #   而预览是「开头 1500 + 结尾 1500」，一共 3000 字符 ——
+    #   只省了 639 个字符，还要多写一个文件。
+    #   阈值调到比 3000 更小时（比如调试用的 600），会变成**负优化**：
+    #   预览比原文还长。
+    #   → 判据不该只问「超没超阈值」，还要问「落盘之后是不是真的更短」。
+    if len(text) <= limit or len(text) <= HEAD_CHARS + TAIL_CHARS:
         return text
 
     path = store_path(tool_name, text, base_dir)
