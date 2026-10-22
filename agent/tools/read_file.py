@@ -86,6 +86,7 @@ class ReadFileTool(Tool):
     description = (
         "读取项目目录内的文本文件并返回内容。"
         "当用户让你看某个文件、读某段配置、总结某个文档时调用。"
+        "文件很长时可以配合 offset 和 max_bytes 分段读取。"
         "只能读取项目目录内的文件，不支持写文件。"
     )
 
@@ -100,12 +101,30 @@ class ReadFileTool(Tool):
                 "type": "integer",
                 "description": f"最多读取的字节数，默认 {DEFAULT_MAX_BYTES}",
             },
+            # 第 6 周加 offset 的原因很实际：
+            #   工具结果落盘后，全文可能有 30 万字符，而 read_file 默认只读 4000 字节。
+            #   没有 offset，模型就只能读到开头 4000 字节 ——
+            #   中间那 29 万字符**在磁盘上但取不回来**，落盘等于白做。
+            #   「数据在」和「能按段取」是两件事，缺一件这个设计就不成立。
+            "offset": {
+                "type": "integer",
+                "description": (
+                    "从第几个字节开始读，默认 0。"
+                    "读长文件的后半段，或按段读一个很大的文件时用它。"
+                ),
+            },
         },
         # path 是必填的 —— 没有路径就不知道读什么。
         "required": ["path"],
     }
 
-    def run(self, path: str, max_bytes: int = DEFAULT_MAX_BYTES, **_: Any) -> str:
+    def run(
+        self,
+        path: str,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+        offset: int = 0,
+        **_: Any,
+    ) -> str:
         # ─────────────────────────────────────────────────────────
         # TODO ① —— 校验路径必须在项目目录内
         #
@@ -184,22 +203,77 @@ class ReadFileTool(Tool):
             return f"[错误] 读取失败：{type(exc).__name__}: {exc}"
 
         limit = int(max_bytes or DEFAULT_MAX_BYTES)
-        truncated = len(raw) > limit
-        chunk = raw[:limit]
-
+        # 负 offset 当 0 处理 —— 模型可能传 -1 表示「从头」，别让它读到倒数第一段。
+        start = max(0, int(offset or 0))
+        # 起点落在汉字中间怎么办？
+        #   UTF-8 的续字节长这样：0b10xxxxxx（即 (b & 0xC0) == 0x80）。
+        #   向后挪到下一个字符的开头 —— 只可能少读 1~2 个字节，不会读错。
+        #   不做这一步的话，模型随手给一个 offset=1000，解码就会崩进 GBK 分支，
+        #   然后它还"成功"返回一串乱码。
+        while 0 < start < len(raw) and (raw[start] & 0xC0) == 0x80:
+            start += 1
+        if start >= len(raw):
+            return (
+                f"[错误] offset={start} 超出了文件长度 {len(raw)} 字节。"
+                f"要读结尾，请用 offset={max(0, len(raw) - max(limit, 1))}。"
+            )
         # 编码问题：Windows 上的中文文件可能是 GBK，也可能是 UTF-8。
-        # 先试 UTF-8，失败再退到 GBK。都失败就用 errors="ignore" 硬解，
-        # 宁可显示得难看，也别崩掉整轮对话。
-        for encoding in ("utf-8", "gbk"):
-            try:
-                text = chunk.decode(encoding)
-                break
-            except UnicodeDecodeError:
-                continue
-        else:
-            text = chunk.decode("utf-8", errors="ignore")
+        #
+        # ⚠️ 第 6 周（加 offset 之后）这里变成了一个**真 bug 的入口**：
+        #    按字节分段时，段边界极容易落在一个汉字中间
+        #    （UTF-8 一个汉字 3 字节，4000 不是 3 的倍数）。
+        #    这时 chunk.decode("utf-8") 会抛 UnicodeDecodeError，
+        #    而「失败了再试 GBK」会**成功解出一串乱码** ——
+        #    模型读到的后半段文件全是看不懂的字，比直接报错更糟：
+        #    它不会觉得自己没读到，它会基于乱码继续推理。
+        #
+        #    所以顺序反过来：先做「边界安全」的 UTF-8（最多回退 3 字节），
+        #    UTF-8 完全不通，才认为这是 GBK 文件。
+        #    被回退掉的那几个字节省进下一段，不丢。
+        text, consumed = self._decode_segment(raw[start:start + limit])
+        # 「还没读完」的判据：起点 + 本次真正消费的字节 < 总长。
+        truncated = start + consumed < len(raw)
 
         header = f"[{path}] 共 {len(raw)} 字节"
+        if start or truncated:
+            # 分段读时把「这次读的是哪一段、下次从哪继续」写清楚。
+            # 不这样写，模型读完第一段会以为全文就这么长 —— 然后开始编。
+            #
+            # ⚠️ 用 consumed 而不是 limit：段边界被回退掉的那 1~3 字节
+            #    还留在原处，下一段的起点必须正好接上，否则那几个字节
+            #    **既没被这次读到、也不会被下次读到** —— 静默丢数据。
+            header += f"，本次返回第 {start}–{start + consumed} 字节"
         if truncated:
-            header += f"，已截断到前 {limit} 字节"
+            header += (
+                f"，后面还有 {len(raw) - start - consumed} 字节"
+                f"（继续读请用 offset={start + consumed}）"
+            )
         return f"{header}\n{text}"
+
+    @staticmethod
+    def _decode_segment(chunk: bytes) -> tuple[str, int]:
+        """把一段字节解成文本，返回 (文本, 实际消费的字节数)。
+
+        两者为什么必须成对返回？
+            因为「解出来的字符串」和「用掉了多少字节」不再是同一件事 ——
+            回退掉的那几个字节要留给下一段。如果只返回字符串、
+            调用方拿 `len(chunk)` 当消费量，那几个字节就被静默丢掉了。
+        """
+        # 先试 UTF-8，成功就完了（绝大多数文件是 UTF-8）。
+        for cut in range(4):
+            piece = chunk[: len(chunk) - cut] if cut else chunk
+            if not piece:
+                break
+            try:
+                return piece.decode("utf-8"), len(piece)
+            except UnicodeDecodeError:
+                continue
+
+        # UTF-8 连回退 3 字节都解不通 → 这是 GBK 文件（老 Windows 常见）。
+        # 这里不再做边界回退：GBK 一个汉字 2 字节，同样可能被切开，
+        # 但试错成本高于收益 —— 真正的兜底是下面的 errors="ignore"。
+        try:
+            return chunk.decode("gbk"), len(chunk)
+        except UnicodeDecodeError:
+            # 最后一道：宁可显示得难看，也别崩掉整轮对话。
+            return chunk.decode("utf-8", errors="ignore"), len(chunk)

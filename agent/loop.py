@@ -19,7 +19,7 @@ from contextlib import nullcontext
 from functools import partial
 from typing import Any, Iterator
 
-from agent import config, context, llm, mcp, metrics, skills
+from agent import config, context, llm, mcp, metrics, skills, tool_results
 from agent.memory import Memory
 from agent.session import Session
 from agent.tools import registry
@@ -774,7 +774,7 @@ class AgentLoop:
         with self.meter.phase("tool") if self.meter else nullcontext():
             if len(tool_calls) == 1 or not all_safe:
                 # 串行：只有一个工具，或有副作用，没有并行的空间/资格
-                return [
+                results = [
                     self.tools.call(tc.name, tc.parsed_arguments())
                     for tc in tool_calls
                 ]
@@ -800,14 +800,30 @@ class AgentLoop:
             #         哪天有人绕过 call() 直接 submit(tool.run)，一个异常就躺在
             #         future 里，等你 .result() 时才炸。
             #
-            # `with` 退出时会等所有线程结束，所以 return 写在 with 里面是安全的：
-            # 能返回，就说明结果已经收齐了。
+            # `with` 退出时会等所有线程结束，所以赋值写在 with 里面是安全的：
+            # 能走到 with 外面，就说明结果已经收齐了。
             jobs = [
                 partial(self.tools.call, tc.name, tc.parsed_arguments())
                 for tc in tool_calls
             ]
             with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-                return list(pool.map(lambda job: job(), jobs))
+                results = list(pool.map(lambda job: job(), jobs))
+
+        # ── 结果进入 messages 之前的最后一站：超大结果落盘 ──────────────
+        #
+        # 位置很关键：放在**并行收完之后**统一处理，而不是塞进每个线程里。
+        # 理由：「这条结果要不要进上下文」是**上下文策略**，不是执行策略。
+        # 执行层（registry.call）只该回答「跑出了什么」，
+        # 一旦它开始关心 token 预算，工具层和上下文层就粘在一起了 ——
+        # 以后想换一种落盘规则，得改所有工具。
+        #
+        # ⚠️ 这不是「截断」。截断是数据丢了，落盘是数据在外面 ——
+        #    前者模型会基于残片自信作答，后者它能自己取回来。
+        #    详见 agent/tool_results.py 开头。
+        return [
+            tool_results.maybe_persist(tc.name, result)
+            for tc, result in zip(tool_calls, results)
+        ]
 
     def _run_tool_rounds(
         self,
