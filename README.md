@@ -1303,13 +1303,50 @@ UTF-8 完全不通才当 GBK 文件。header 改成报「本次返回第 a–b �
   - [x] 流式：**已吐出字符后绝不重试**，否则前端会出现「你好你好」
   - [x] 真机（本地 socket）：503→3 次 3.58s / 401→1 次 0.01s / 429+Retry-After:2→2.00s
   - [x] 13 条测试；三轮变异（忽略状态码 4 红 / 流式无脑重试 1 红 / 退避不变 1 红）
+- [x] **第 6 周 · 收尾：版本对齐 + 两个「不会报错的错」（2026-10-26）**
+  - [x] `cli.py` 的 `VERSION = "v0.7"` 删掉，改成和 `server.py` 一样从包元数据读
+        （五周以来 `--help` 一直在报旧版本；修复后实测输出 `v0.11.0`）
+  - [x] `pyproject.toml` → `0.12.0`，补齐 tag（v0.11.0 当时漏打，已并入 v0.12.0）
+  - [x] `tests/fake_mcp_server.py` 补 `sys.stdin/stdout.reconfigure(encoding="utf-8")`
+        （中文 Windows 代码页 936 下，桩用 GBK 吐中文、client 按 UTF-8 解 → 2 条 MCP 测试红）
+  - [x] README 新增「版本与发布」小节，把「版本号只有一个来源」写死成规矩
+  - [x] 已知局限清掉一条（`max_iterations` 收尾已由可靠性 ② 解决），并注明测试对 `data/` 可写的依赖
 - [x] **`pytest` 全绿：143 passed**
+  - 前提：需要项目内 `data/tool_results/` **可写**（`test_persisted_result_can_be_read_back`
+    故意走真实落盘目录，才能验证「落盘 → 按段读回 → 拼回原文」这条完整闭环）。
+    在只读沙箱或受限令牌下跑，会是 `142 passed, 1 failed (PermissionError)` —— 那是环境，不是代码。
+  - 2026-10-26 补修：`tests/fake_mcp_server.py` 漏了 `sys.stdout.reconfigure(encoding="utf-8")`，
+    导致中文 Windows（代码页 936）下 2 条 MCP 测试显示乱码断言失败。
+    真 server 一直是 UTF-8，桩不是 —— 假 server 也是 server，规范要求它就不能例外。
 - [ ] **已知局限（诚实清单）**
   - [ ] wheel 里**不含** `web/`（`index.html` 与 `vendor/`）—— 只影响 `pip install` 分发，`uv run` 不受影响
   - [ ] HTTP 层**零鉴权** —— 只能在本机用，不能直接暴露到公网
   - [ ] `_agents` 会话池没有 TTL，长期跑会一直占内存
-  - [ ] 撞上 `max_iterations` 时，工具结果在 `messages` 里但用户拿不到 —— 正确做法是再发一次不带 `tools` 的请求收尾
   - [ ] 停止按钮**省不了已经发出的那次请求**的钱（中止发生在两个 chunk 之间）
+  - [x] ~~撞上 `max_iterations` 时，工具结果在 `messages` 里但用户拿不到~~ → 已由可靠性 ② 解决（三级兜底）
+
+## 版本与发布
+
+版本号**只有一个来源**：`pyproject.toml` 的 `version`。`cli.py` 和 `server.py` 都从包元数据读它。
+
+> 这一条是被坑出来的：`cli.py` 从 v0.7 起就手写着 `VERSION = "v0.7"`，
+> 而 `pyproject.toml` 早已是 0.11.0 —— `mini-agent --help` 连续五周都在对外报旧版本号。
+> **不会报错的错，才会一直错下去。** 能推导的东西，不要抄写。
+
+| 版本 | 内容 | tag |
+|---|---|---|
+| v0.10 | 工具调用接入 Web（流式 + 分片归并） | ✅ `v0.10` |
+| v0.11.0 | 打包 + 并发 + 指标 + 测试（第 4 周收尾） | ⚠️ 当时**漏打** tag，已在 v0.12.0 一并覆盖 |
+| v0.12.0 | 第 5 周 MCP/skill + 一键启动 + 第 6 周可靠性 ①②③ | ✅ `v0.12.0` |
+
+改完 `pyproject.toml` 的版本后要重装一次，元数据才会跟着变：
+
+```bash
+uv sync                # 或 uv pip install -e .
+mini-agent --help      # 头部应显示新版本
+```
+
+不重装的话，`--help` 报的还是上一次装进去的旧版本 —— 因为读的是**已安装**的元数据，不是源码。
 
 ## 许可
 

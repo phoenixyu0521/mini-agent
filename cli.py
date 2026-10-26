@@ -44,6 +44,8 @@ from __future__ import annotations
 
 import argparse
 import sys
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as pkg_version
 from typing import Any
 
 from agent import config as config_mod
@@ -52,8 +54,16 @@ from agent.loop import DEFAULT_SYSTEM, AgentLoop
 from agent.memory import Memory
 from agent.session import Session
 
-
-VERSION = "v0.7"
+# 版本号只能有**一个**来源：pyproject.toml 的 version。
+#
+# 这里原来手写着 "v0.7"，而 pyproject 早在第 4 周就已经是 0.11.0 ——
+# `mini-agent --help` 一直在对外报一个五周前的版本号（实际看到的是 v0.7）。
+# 和 server.py 里那次是同一个坑：**这种错不会报错，只会骗人。**
+try:
+    VERSION = "v" + pkg_version("mini-agent")
+except PackageNotFoundError:
+    # 裸 `python cli.py`（项目没装进环境）时的降级：宁可显示 dev，也不编一个号
+    VERSION = "dev"
 
 
 def parse_args() -> argparse.Namespace:

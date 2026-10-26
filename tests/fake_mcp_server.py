@@ -79,6 +79,20 @@ def call_tool(name: str, arguments: dict) -> tuple[str, bool]:
 
 
 def main() -> None:
+    # 和真 server（mcp_servers/protocol.py）保持一致：显式把 stdio 切到 UTF-8。
+    #
+    # 为什么这个桩也必须写这两行：
+    #     中文 Windows 的 sys.stdout 默认是 GBK。桩用文本模式 write 中文 → 落进管道的
+    #     是 GBK 字节；而 client（agent/mcp/protocol.py 的 read）明确按 **UTF-8** 解码，
+    #     于是中文变乱码。表现很奇怪：协议全对、只有中文内容坏掉。
+    #
+    #     实测（2026-10-26，代码页 936）：不写这两行，test_mcp.py 红 2 条，
+    #     报错是 `assert '参数不对' in "[错误] …\ufffd\ufffd\ufffd…"` ——
+    #     看起来像 client 的 bug，其实是桩自己吐错了编码。
+    #     **假 server 也是 server，规范要求 UTF-8，它就不能例外。**
+    sys.stdin.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8")
+
     for raw in sys.stdin:
         raw = raw.strip()
         if not raw:

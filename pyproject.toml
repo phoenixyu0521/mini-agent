@@ -1,7 +1,9 @@
 [project]
 name = "mini-agent"
-version = "0.11.0"
-description = "从零手写的 Agent 内核（4 周学习项目）"
+# 版本号是**唯一**来源：cli.py 和 server.py 都从包元数据读它，不再各自手写。
+# （cli.py 曾经手写 "v0.7" 骗了五周，2026-10-26 修掉。）
+version = "0.12.0"
+description = "从零手写的 Agent 内核（6 周学习项目）"
 readme = "README.md"
 requires-python = ">=3.11"
 
