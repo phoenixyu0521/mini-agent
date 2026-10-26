@@ -3,6 +3,8 @@
 [![CI](https://github.com/phoenixyu0521/mini-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/phoenixyu0521/mini-agent/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+![mini-agent 界面：左侧是会话列表，中间是对话，问题是让模型用 read_file 读 README 并报字节数，底部展开的是这一轮发给模型的工具说明书](docs/ui-overview.png)
+
 **从零实现的 Agent 内核 —— 不使用任何 Agent 框架。**
 
 `messages` 循环、工具协议、MCP client / server、skill 系统全部手写。
@@ -10,7 +12,7 @@
 
 | | |
 |---|---|
-| 内核规模 | 4,500 行（含测试 8,400 行） |
+| 内核规模 | 6,070 行（全仓库 Python 约 10,575 行，其中测试 2,546 行） |
 | 测试 | 144 条，含**变异测试**（故意改坏实现，验证断言不是空转） |
 | 互操作 | 自建 MCP server 已被 **Cursor** 作为第三方客户端验证通过 |
 | 许可 | MIT |
@@ -18,6 +20,27 @@
 每一处设计决策都写了「为什么」和实测数字 —— 包括**被实测推翻的那些**：
 最初认为「接私有数据才有价值」，A/B 实验证明关掉工具模型仍能答对 4/4，
 于是判据改成了「模型会不会编造」。
+
+## 技术栈
+
+「不用框架」指的是**不用 Agent 框架**（LangChain / LlamaIndex / AutoGen），
+不是不用库。下面每一行都能在 `pyproject.toml` 或代码里查到，
+右列写的是**选它的理由**，不是它的名字。
+
+| 层 | 用了什么 | 为什么是它 |
+|---|---|---|
+| 语言 / 环境 | Python 3.11+、`uv`（`uv.lock` 锁定） | 换台机器一条 `uv sync` 就完全一致 |
+| 模型调用 | `httpx`，流式走 `client.stream()` | 不用 openai SDK —— 直接对着 HTTP 写，才看得见 `tool_calls` 是怎么一片片下发的 |
+| Token 估算 | 自写字符估算 | 不引 `tiktoken`：预算只要量级对，判据是「超没超」而不是「超多少」 |
+| 并发 | `ThreadPoolExecutor`（工具）+ `asyncio`（HTTP） | 工具是同步阻塞的，`async def` + `asyncio.gather` 救不了它 |
+| Web 服务 | FastAPI + Uvicorn + `StreamingResponse` | SSE 把流式结果推给浏览器；`StaticFiles` 挂前端 |
+| 前端 | 原生 JS（零框架）+ `marked` + `highlight.js` | 两个库放本地 `web/vendor/`，不走 CDN —— 断网也能用 |
+| 会话存储 | JSONL，追加写 | 只 append 不重写，崩了最多丢最后一行 |
+| 长期记忆 | Markdown（`MEMORY.md`） | 人和模型都能直接读写，不用工具也能改 |
+| 文档检索 | SQLite **FTS5** 虚拟表 | 不用向量库：MCP server 是 stdio 子进程，握手阶段加载 embedding 模型必然超时 |
+| 协议 | MCP（JSON-RPC over stdio），协商三个版本 | 客户端协议版本不统一，硬编码一个必挂 |
+| 测试 | pytest 9，144 条 + 变异验证 | 「改坏一处必须变红」才算真测过 |
+| CI | GitHub Actions 三平台矩阵 + 打包 job | 只在 macOS 挂的那个错（全角括号被吃进变量名），本地永远复现不出来 |
 
 ## 五周，五个结论
 
