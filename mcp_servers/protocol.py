@@ -200,6 +200,18 @@ def serve(server: MCPServer) -> None:
     # ⚠️ 中文 Windows 默认 GBK，不改成 UTF-8 客户端会乱码
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stdin.reconfigure(encoding="utf-8")
+    # stderr 也必须一起改 —— 这一行 2026-10-26 才补上，之前漏了。
+    #
+    # 为什么漏了会出事？日志走 stderr（stdout 是协议通道），而下一行
+    # log("…已启动，等待客户端…") 立刻就打中文。GBK 环境下这串中文按
+    # cp936 编码发出去，客户端按 UTF-8 读 → 要么日志里一堆乱码，
+    # 要么客户端收集 stderr 的线程直接抛 UnicodeDecodeError。
+    #
+    # 这个 bug 只在不设 PYTHONUTF8 的中文 Windows 上出现 ——
+    # 开发机上 PYTHONUTF8=1 时永远看不见，CI 上也不一定复现，
+    # 恰好是「交到别人手上才发现」的那一类。
+    # errors="replace" 是保险：日志不该因为一个怪字符把整条链路弄崩。
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
     log(f"{server.name} v{server.version} 已启动，等待客户端…")
 

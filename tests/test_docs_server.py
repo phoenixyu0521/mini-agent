@@ -266,3 +266,58 @@ def test_protocol_version_is_negotiated():
     reply = server.handle({"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": {}})
     assert reply["result"]["protocolVersion"] == PROTOCOL_VERSION
 
+
+def test_stderr_is_valid_utf8_even_without_pythonutf8():
+    """子进程的 stderr 必须是合法 UTF-8，哪怕环境里没有 PYTHONUTF8。
+
+    为什么专门测 stderr？
+        2026-10-26 的实测：`serve()` 里 reconfigure 了 stdout 和 stdin，
+        **唯独漏了 stderr**。而紧接着第一行日志就是中文
+        （「…已启动，等待客户端…」），GBK 环境下它按 cp936 编码发出去。
+        客户端读 stderr 的线程按 UTF-8 解 → UnicodeDecodeError，
+        而主线程因为 stdout 里的 JSON 是纯 ASCII，照样跑通 ——
+        于是测试是绿的，bug 在日志线程里悄悄发生。
+
+        MCP 的规矩是：stdout 是协议通道，日志只能走 stderr。
+        所以 stderr 的编码和协议一样重要。
+
+    为什么要在子进程里清掉 PYTHONUTF8？
+        开发机上这个变量通常是 1，子进程继承它就自动 UTF-8，
+        测试永远绿 —— 而用户拿到的中文 Windows 上并没有这个变量。
+        不清掉就等于没测。
+    """
+    import json as _json
+    import subprocess
+    import tempfile
+
+    launch = os.path.join(PROJ, "mcp_servers", "launch.py")
+    msg = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}\n'
+
+    # 还原成「中文 Windows 默认」：不带任何 UTF-8 开关
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("PYTHONUTF8", "PYTHONIOENCODING", "PYTHONLEGACYWINDOWSSTDIO")
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = subprocess.run(
+            [sys.executable, launch],
+            input=msg.encode("utf-8"),
+            capture_output=True,          # 注意：不传 text/encoding，拿原始字节
+            cwd=tmp,
+            env=env,
+            timeout=60,
+        )
+
+    assert proc.returncode == 0
+
+    # 这两条是核心：stderr 一个字节都不能是非法 UTF-8。
+    # decode 失败会抛 UnicodeDecodeError，测试直接红 —— 正是我们要的。
+    stderr_text = proc.stderr.decode("utf-8")
+    assert "已启动" in stderr_text, f"stderr 里应该有启动日志，实际是：{stderr_text[:200]!r}"
+
+    # 顺带确认 stdout 也只含合法 UTF-8（协议通道，同样不能坏）
+    reply = _json.loads(proc.stdout.decode("utf-8").strip().splitlines()[0])
+    assert reply["result"]["serverInfo"]["name"] == "hello-agents-docs"
+
