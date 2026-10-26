@@ -472,6 +472,27 @@ async def write_memory(req: MemoryRequest) -> dict[str, Any]:
 
 
 def main() -> None:
+    # 为什么要加 argparse？原来 `mini-agent-server --help` 会**直接启动服务器**，
+    # 想看看这命令怎么用的人，得到的是一个跑起来的服务和一个占住的终端。
+    # 2026-10-26 在 CI 上暴露出来：那条「两个入口命令都在」的检查
+    # 用 `--help` 探测，结果卡到超时 —— 不是 CI 写错了，是这个命令本身的问题。
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="mini-agent-server",
+        description="mini-agent 的网页界面（FastAPI + 原生 JS），默认只监听本机。",
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="监听地址，默认 127.0.0.1（只有本机能访问）",
+    )
+    parser.add_argument(
+        "--port", type=int, default=8000,
+        help="端口，默认 8000",
+    )
+    parser.add_argument("--version", action="version", version=f"mini-agent {VERSION}")
+    args = parser.parse_args()
+
     # 先验配置 —— 和 cli.py 同一个理由：报错要在门口报，
     # 不要等用户敲完一句话才发现 Key 没配。
     try:
@@ -480,10 +501,21 @@ def main() -> None:
         print("[配置错误]", exc)
         raise SystemExit(1)
 
+    # 这个服务没有任何鉴权（见 README 的「已知局限」）。
+    # 绑到非本机地址 = 把「能读你项目文件、能执行白名单命令」的 Agent
+    # 开放给整个网络。默认值是安全的，改之前必须让人知道自己在做什么。
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        print("=" * 60)
+        print("[警告] 这个服务没有任何鉴权。")
+        print(f"       绑定到 {args.host} 意味着同网络内任何人都能用它")
+        print("       读你项目里的文件、执行允许的命令。")
+        print("       只在完全可信的网络里这么做。")
+        print("=" * 60)
+
     print(f"mini-agent {VERSION}")
-    print("  接口文档：http://127.0.0.1:8000/docs")
-    print("  聊天界面：http://127.0.0.1:8000")
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    print(f"  接口文档：http://{args.host}:{args.port}/docs")
+    print(f"  聊天界面：http://{args.host}:{args.port}")
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

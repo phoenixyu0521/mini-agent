@@ -80,7 +80,23 @@ jobs:
           code=$?
           echo "$out"
           if [ "$code" -ne 0 ]; then
-            echo "::error::测试失败（pytest 退出码 $code）"
+            # ⚠️ 下面这些变量**必须写成 ${}**，不能写 $WANT。
+            #
+            # 首次 CI 就栽在这里，报错是：
+            #     line 41: passed�: unbound variable
+            # 也就是 bash 把全角右括号吃进了变量名。
+            #
+            # 而且**只有 macOS 那个 job 挂**，ubuntu 和 windows 都没事。
+            # 最可能的原因是 bash 版本：macOS 自带 /bin/bash 是 3.2（2007 年），
+            # ubuntu 是 5.x，两者解析变量名边界的规则不同。
+            # 我这里**没有**独立验证过具体是哪一条规则 ——
+            # 在本地 Git Bash 上复现不出来，只能确定「加了大括号就不出问题」，
+            # 因为 ${} 是显式边界，不依赖解析规则。
+            #
+            # 教训：这类「同一份脚本，一个平台绿两个不绿」的错，
+            # 本地怎么测都测不出来。跨平台脚本里，凡是变量后面紧跟
+            # 非 ASCII 字符，一律加大括号 —— 这不是洁癖，是唯一可靠的做法。
+            echo "::error::测试失败（pytest 退出码 ${code}）"
             exit "$code"
           fi
 
@@ -92,7 +108,7 @@ jobs:
           # 改成解析汇总行 —— 少一个依赖，也少一次「为了拿计数再跑一遍」
           # 的浪费（原来那个写法把整套测试跑两次）。
           line=$(echo "$out" | grep -E '[0-9]+ passed' | tail -1)
-          echo "汇总行：$line"
+          echo "汇总行：${line}"
           passed=$(echo "$line" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+')
           if [ -z "${passed:-}" ]; then
             echo "::error::汇总行里读不到通过数，无法确认测试真的跑了"
@@ -104,10 +120,10 @@ jobs:
           # 现在实际 144 条，其中 6 条依赖 FTS5 索引（data/ 不入库），
           # 在 CI 上会 skip → 实际 138 passed。所以阈值取 130 留出余量。
           if [ "$passed" -lt 130 ]; then
-            echo "::error::只通过 $passed 条（< 130）—— 要么收集范围坏了，要么删了测试"
+            echo "::error::只通过 ${passed} 条（< 130）—— 要么收集范围坏了，要么删了测试"
             exit 1
           fi
-          echo "✅ passed=$passed（阈值 130）"
+          echo "✅ passed=${passed}（阈值 130）"
 
   # 单独一条：验证「一条命令装完就能用」这件事没坏。
   # 第 4 周做的打包（[project.scripts]）是零文档也能上手的前提，
@@ -146,12 +162,12 @@ jobs:
           # 会让整个赋值语句直接失败，后面的 -z 判空永远走不到，
           # 报出来的错也就变成「命令失败」而不是「找不到版本号」。
           got=$(uv run mini-agent --help | grep -o 'v[0-9]\+\(\.[0-9]\+\)\+' | head -1 | tr -d 'v' || true)
-          echo "pyproject=$want   --help=$got"
+          echo "pyproject=${want}   --help=${got}"
           if [ -z "$got" ]; then
             echo "::error::--help 输出里找不到版本号"
             exit 1
           fi
           if [ "$want" != "$got" ]; then
-            echo "::error::--help 报的版本($got) 和 pyproject 里的版本($want) 不一样"
+            echo "::error::--help 报的版本(${got}) 和 pyproject 里的版本(${want}) 不一样"
             exit 1
           fi
