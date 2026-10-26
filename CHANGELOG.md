@@ -88,6 +88,11 @@ skill 系统、渠道层，以及可靠性三件套。测试从 16 条涨到 144
 
 ### 修复
 
+- `mini-agent-server --help` 原来**会直接启动服务器**：想看看这命令怎么用的人，
+  得到的是一个跑起来的服务和一个占住的终端。加 argparse 修掉，
+  顺带 `--host` / `--port` 可配置。
+- `--host` 绑到非本机地址时打印警告，说明这个服务没有任何鉴权 ——
+  局限写在文档里没人看，写在用户正要越界的那一刻才有用。
 - MCP server 的 `stderr` 没有设成 UTF-8：日志走 stderr，而第一行日志就是中文。
   中文 Windows 下按 cp936 编码发出去，客户端按 UTF-8 读会 `UnicodeDecodeError`，
   英文 runner 上则是 cp1252 编不了中文直接 `UnicodeEncodeError`。
@@ -103,6 +108,30 @@ skill 系统、渠道层，以及可靠性三件套。测试从 16 条涨到 144
 - 模型什么都没说就调工具时留下空的灰色气泡。
 - `fake_mcp_server.py` 在中文 Windows 下按 GBK 输出，导致 2 条 MCP 测试
   看起来像逻辑错误、其实是编码问题。
+
+### 工程化
+
+- **CI**（`.github/workflows/ci.yml`）：ubuntu / windows / macos 三平台 × Python 3.12，
+  外加一个专门验证打包的 job（两个入口命令能跑、`--help` 的版本号和 `pyproject` 同源）。
+  windows 必须在矩阵里 —— 这个项目一半的坑（GBK 编码、路径分隔符、
+  `.bat` 按字节解析）只在 Windows 上出现。
+- **`CHANGELOG.md`**：就是这个文件。按版本记到 0.1.0，每个版本标明 tag 状态。
+- **推广前先在本地复现 CI 条件**：把项目复制到临时目录、删掉 `.env`、
+  再清掉 `PYTHONUTF8`，跑一遍才发现 MCP server 的 stderr bug ——
+  这件事推上去再做，就是让别人先看到一次红色 CI。
+
+> CI 首次运行的结果是 **2 绿 2 红**，两个失败都是真问题：
+>
+> 1. macOS 的 `line 41: passed�: unbound variable` ——
+>    `echo "…$passed（阈值 130）"` 里的全角括号被 bash 吃进了变量名。
+>    同一份脚本 ubuntu 和 windows 都没事，只有 macOS 挂
+>    （它的 `/bin/bash` 是 3.2，2007 年的版本）。
+>    统一改成 `${passed}`，显式边界不依赖任何解析规则。
+> 2. 打包 job 挂在 `mini-agent-server --help` —— 它不认 `--help`，
+>    直接起服务器并占住，一直卡到超时。这就是上面那条修复的由来。
+>
+> 两个都在本地无法复现，只能靠 CI 抓。所以 CI 的意义不只是「证明代码能跑」，
+> 是**让三个平台替你测那些你没有的环境**。
 
 ### 变更
 

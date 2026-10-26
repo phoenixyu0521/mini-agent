@@ -1326,6 +1326,15 @@ UTF-8 完全不通才当 GBK 文件。header 改成报「本次返回第 a–b �
     - 矩阵里写了 `python: 3.11/3.12` 却没给 `uv sync` 传 `--python`，
       6 个 job 实际全用 `.python-version` 的 3.12 —— 假矩阵比没有矩阵更糟
     - CI 写死 uv 0.9.28，开发机是 0.12.17；环境和本地不一致会产生最难查的那种问题
+  - [x] **首次 CI 跑出 2 绿 2 红**，两个失败都是真问题（本地都复现不出来）：
+    - macOS `line 41: passed�: unbound variable` ——
+      `echo "…$passed（阈值 130）"` 里的全角括号被 bash 吃进了变量名。
+      ubuntu 和 windows 都没事，因为 macOS 自带的 `/bin/bash` 是 3.2（2007 年）。
+      统一改成 `${passed}`：显式边界，不依赖任何解析规则
+    - `mini-agent-server --help` 不认 `--help`，直接起服务器并占住，卡到超时
+      → 加 argparse；顺带 `--host` 绑非本机地址时打印「这个服务没有鉴权」的警告
+  - [x] 修完第二轮 **4 个 job 全绿**（run 40285414178）
+  - [x] tag 从「CI 红的那次提交」移到全绿的那个：v0.12.0 应该指向好版本
 - [x] **顺手修掉一个「只在别人机器上出现」的 bug**
   - [x] `mcp_servers/protocol.py` 的 `serve()` 只 reconfigure 了 stdout 和 stdin，**漏了 stderr**
   - [x] 而 `serve()` 之后第一行日志就是中文（「…已启动，等待客户端…」），正好走 stderr
@@ -1345,6 +1354,7 @@ UTF-8 完全不通才当 GBK 文件。header 改成报「本次返回第 a–b �
 - [ ] **已知局限（诚实清单）**
   - [ ] wheel 里**不含** `web/`（`index.html` 与 `vendor/`）—— 只影响 `pip install` 分发，`uv run` 不受影响
   - [ ] HTTP 层**零鉴权** —— 只能在本机用，不能直接暴露到公网
+        （`--host` 绑非本机地址时会打印警告，但**警告不是防护**，别把它当安全措施）
   - [ ] `_agents` 会话池没有 TTL，长期跑会一直占内存
   - [ ] 停止按钮**省不了已经发出的那次请求**的钱（中止发生在两个 chunk 之间）
   - [x] ~~撞上 `max_iterations` 时，工具结果在 `messages` 里但用户拿不到~~ → 已由可靠性 ② 解决（三级兜底）
