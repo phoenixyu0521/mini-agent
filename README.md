@@ -1,5 +1,8 @@
 # mini-agent
 
+[![CI](https://github.com/phoenixyu0521/mini-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/phoenixyu0521/mini-agent/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **从零实现的 Agent 内核 —— 不使用任何 Agent 框架。**
 
 `messages` 循环、工具协议、MCP client / server、skill 系统全部手写。
@@ -8,7 +11,7 @@
 | | |
 |---|---|
 | 内核规模 | 4,500 行（含测试 8,400 行） |
-| 测试 | 143 条，含**变异测试**（故意改坏实现，验证断言不是空转） |
+| 测试 | 144 条，含**变异测试**（故意改坏实现，验证断言不是空转） |
 | 互操作 | 自建 MCP server 已被 **Cursor** 作为第三方客户端验证通过 |
 | 许可 | MIT |
 
@@ -1311,7 +1314,28 @@ UTF-8 完全不通才当 GBK 文件。header 改成报「本次返回第 a–b �
         （中文 Windows 代码页 936 下，桩用 GBK 吐中文、client 按 UTF-8 解 → 2 条 MCP 测试红）
   - [x] README 新增「版本与发布」小节，把「版本号只有一个来源」写死成规矩
   - [x] 已知局限清掉一条（`max_iterations` 收尾已由可靠性 ② 解决），并注明测试对 `data/` 可写的依赖
-- [x] **`pytest` 全绿：143 passed**
+- [x] **阶段 2 · 工程化：CI + CHANGELOG（2026-10-26）**
+  - [x] `.github/workflows/ci.yml` —— 三平台矩阵（ubuntu / windows / macos）× Python 3.12
+  - [x] 第二个 job 专门验证打包：两个入口命令可执行，且 `--help` 的版本号与 `pyproject` 同源
+  - [x] `CHANGELOG.md` —— 按版本记到 0.1.0，每个版本标明 tag 状态（没打过的就说没打）
+  - [x] 打 `v0.12.0` tag，消掉「代码写 0.12.0、tag 停在 v0.10」的不一致
+  - [x] 首次实跑前先在本地复现 CI 条件，修掉四个「一推上去必红」的坑：
+    - `--report-log` 不是 pytest 内置参数（需要单独插件），传了直接 unrecognized arguments
+    - `pyproject` 的 `addopts = "-q"` 加上命令行的 `-q` 叠成 **`-qq`**，pytest 连汇总行都不打
+      → 从输出里读通过数的逻辑永远读到空，报错却看起来像「收集坏了」
+    - 矩阵里写了 `python: 3.11/3.12` 却没给 `uv sync` 传 `--python`，
+      6 个 job 实际全用 `.python-version` 的 3.12 —— 假矩阵比没有矩阵更糟
+    - CI 写死 uv 0.9.28，开发机是 0.12.17；环境和本地不一致会产生最难查的那种问题
+- [x] **顺手修掉一个「只在别人机器上出现」的 bug**
+  - [x] `mcp_servers/protocol.py` 的 `serve()` 只 reconfigure 了 stdout 和 stdin，**漏了 stderr**
+  - [x] 而 `serve()` 之后第一行日志就是中文（「…已启动，等待客户端…」），正好走 stderr
+  - [x] 中文 Windows 下按 cp936 编码发出去，客户端按 UTF-8 读 → `UnicodeDecodeError`；
+        英文 runner 上反着来：cp1252 编不了中文 → `UnicodeEncodeError`
+  - [x] 两种都只在「不设 `PYTHONUTF8`」时出现，而开发机上这个变量通常是 1 → 永远看不见
+  - [x] 之前只修了 `tests/fake_mcp_server.py`（测试桩），把被测代码漏了 —— 方向反了
+  - [x] 新增 `test_stderr_is_valid_utf8_even_without_pythonutf8`，在子进程里**清掉** `PYTHONUTF8`
+  - [x] 变异验证：删掉那一行 reconfigure，测试立刻红，报的正是 `0xd2 in position 25`
+- [x] **`pytest` 全绿：144 passed**
   - 前提：需要项目内 `data/tool_results/` **可写**（`test_persisted_result_can_be_read_back`
     故意走真实落盘目录，才能验证「落盘 → 按段读回 → 拼回原文」这条完整闭环）。
     在只读沙箱或受限令牌下跑，会是 `142 passed, 1 failed (PermissionError)` —— 那是环境，不是代码。
@@ -1328,6 +1352,7 @@ UTF-8 完全不通才当 GBK 文件。header 改成报「本次返回第 a–b �
 ## 版本与发布
 
 版本号**只有一个来源**：`pyproject.toml` 的 `version`。`cli.py` 和 `server.py` 都从包元数据读它。
+每个版本改了什么，见 [CHANGELOG.md](CHANGELOG.md)。
 
 > 这一条是被坑出来的：`cli.py` 从 v0.7 起就手写着 `VERSION = "v0.7"`，
 > 而 `pyproject.toml` 早已是 0.11.0 —— `mini-agent --help` 连续五周都在对外报旧版本号。

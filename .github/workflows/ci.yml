@@ -1,0 +1,157 @@
+name: CI
+
+# 什么时候跑：
+#   - 每次 push 到 main
+#   - 每个 PR
+#   - 也可以手动点（Actions 页面那个 "Run workflow" 按钮）
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支连着 push 时，取消掉上一次还没跑完的，省时间也省免费的 runner 额度
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test / ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 一个平台挂了，不代表别的平台的结果没价值 —— 全跑完再一起看
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        # 暂时只跑 3.12（= .python-version 里的值，也是开发机验证过的版本）。
+        # 为什么不一次上 3.11？本地从没在 3.11 上跑过这 144 条，
+        # 首次 CI 如果因为版本差异红一片，红色徽章会一直挂着，
+        # 反而没人再看它。先让它绿，再扩版本 —— 顺序反过来就白折腾。
+        python: ["3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装 uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          # 写死版本：CI 的解析结果不该因为上游发了新版而自己变。
+          # 这里用开发机上实测过的那一版（uv 0.12.17），
+          # 不用一个「看起来更新」但没人跑过的版本 —— CI 和本地不一致，
+          # 就会出现「本地能跑、CI 不能跑」这种最费时间的问题。
+          version: "0.12.17"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: 装 Python ${{ matrix.python }}
+        run: uv python install ${{ matrix.python }}
+
+      - name: 按 uv.lock 建环境
+        # --frozen：uv.lock 和 pyproject 不一致时**直接报错**，不要偷偷帮我们改锁文件。
+        # 这一条是防止「本地改了 pyproject 却忘了 uv lock，CI 静默装成另一个样子」。
+        #
+        # --python 必须显式传：不传的话 uv 会读 .python-version（3.12），
+        # 矩阵里的版本号就完全不起作用 —— 6 个 job 实际跑的是同一个 Python，
+        # 看起来测了 6 种组合，其实只测了 1 种。这种假矩阵比没有矩阵更糟。
+        run: uv sync --frozen --python ${{ matrix.python }}
+
+      - name: 跑测试
+        shell: bash
+        # 注意：这里**故意不设** PYTHONUTF8。
+        #   2026-10-26 实测发现一个真 bug：mcp_servers/protocol.py 的 serve()
+        #   只 reconfigure 了 stdout 和 stdin，**漏了 stderr**，而第一行日志就是中文。
+        #   中文 Windows 按 cp936 编码发出去，客户端按 UTF-8 读 → UnicodeDecodeError；
+        #   英文 runner 上是反过来的：cp1252 编不了中文，直接 UnicodeEncodeError。
+        #   两种都只在「不设 PYTHONUTF8」时出现。
+        #   如果 CI 帮我们设了，这个 bug 在 CI 里永远看不见，
+        #   只会在用户自己机器上炸 —— 所以这里保持和真实用户一致的环境。
+        run: |
+          set -uo pipefail
+          # 这里**不加** -q：pyproject 的 [tool.pytest.ini_options] 里
+          # addopts 已经是 "-q"，命令行再给一个就叠成 -qq，
+          # 而 -qq 会让 pytest 连汇总行（"144 passed in 5.6s"）都不打。
+          # 汇总行没了，下面的计数就永远是空的 → CI 每次都红，
+          # 而报错看上去像「测试收集坏了」，实际只是关掉了一行输出。
+          # 实测对比（2026-10-26）：
+          #   uv run pytest            → 144 passed, 1 warning in 5.68s
+          #   uv run pytest -q         → 只有警告和 Docs 那两行，没有汇总
+          out=$(uv run --python ${{ matrix.python }} pytest --no-header 2>&1)
+          code=$?
+          echo "$out"
+          if [ "$code" -ne 0 ]; then
+            echo "::error::测试失败（pytest 退出码 $code）"
+            exit "$code"
+          fi
+
+          # 防「0 条通过」的假绿：pytest 一条都没收集到时也可能 exit 0
+          # （testpaths 写错、conftest 全 skip 掉都会这样）。
+          #
+          # 这里不用 --report-log：实测 pytest 9.1.1 不认这个参数
+          # （它需要单独的插件），传了会直接 unrecognized arguments。
+          # 改成解析汇总行 —— 少一个依赖，也少一次「为了拿计数再跑一遍」
+          # 的浪费（原来那个写法把整套测试跑两次）。
+          line=$(echo "$out" | grep -E '[0-9]+ passed' | tail -1)
+          echo "汇总行：$line"
+          passed=$(echo "$line" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+')
+          if [ -z "${passed:-}" ]; then
+            echo "::error::汇总行里读不到通过数，无法确认测试真的跑了"
+            exit 1
+          fi
+
+          # 阈值 130 是「明显变少」而不是「精确相等」：
+          # 加测试不会让它红，删掉一整片才会。
+          # 现在实际 144 条，其中 6 条依赖 FTS5 索引（data/ 不入库），
+          # 在 CI 上会 skip → 实际 138 passed。所以阈值取 130 留出余量。
+          if [ "$passed" -lt 130 ]; then
+            echo "::error::只通过 $passed 条（< 130）—— 要么收集范围坏了，要么删了测试"
+            exit 1
+          fi
+          echo "✅ passed=$passed（阈值 130）"
+
+  # 单独一条：验证「一条命令装完就能用」这件事没坏。
+  # 第 4 周做的打包（[project.scripts]）是零文档也能上手的前提，
+  # 它坏了 CI 里别的测试全绿也发现不了。
+  packaging:
+    name: 打包后两个命令可执行
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.17"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - run: uv sync --frozen
+
+      - name: 两个入口命令都在
+        run: |
+          set -euo pipefail
+          uv run mini-agent --help > /dev/null
+          uv run mini-agent-server --help > /dev/null
+
+      - name: --help 里报的版本号必须等于 pyproject 里的版本
+        # 这条是给 2026-10-26 那个 bug 上锁的：
+        # cli.py 曾经硬编码 "v0.7"，而 pyproject 早就是 0.11.0，
+        # 结果 `--help` 连续五周对外报旧版本号，没有人发现。
+        # 现在版本号只有一个来源，这里验证它真的同源。
+        #
+        # 注意：版本号**不在第 1 行**（第 1 行是 usage:），它在第 6 行左右。
+        # 所以这里用全文 grep，不依赖行号 —— 以后 --help 排版变了也不会误红。
+        run: |
+          set -euo pipefail
+          want=$(uv run python -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'])")
+          # `|| true`：grep 找不到时返回 1，在有 pipefail 的 shell 里
+          # 会让整个赋值语句直接失败，后面的 -z 判空永远走不到，
+          # 报出来的错也就变成「命令失败」而不是「找不到版本号」。
+          got=$(uv run mini-agent --help | grep -o 'v[0-9]\+\(\.[0-9]\+\)\+' | head -1 | tr -d 'v' || true)
+          echo "pyproject=$want   --help=$got"
+          if [ -z "$got" ]; then
+            echo "::error::--help 输出里找不到版本号"
+            exit 1
+          fi
+          if [ "$want" != "$got" ]; then
+            echo "::error::--help 报的版本($got) 和 pyproject 里的版本($want) 不一样"
+            exit 1
+          fi
